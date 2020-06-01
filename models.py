@@ -67,13 +67,16 @@ class PreBuildConverter:
         conv = model.features[0]
         classifier = model.classifier[-1]
 
-        model.features[0] = Conv2d(self.in_channels, conv.out_channels,
-                                   kernel_size=conv.kernel_size, stride=conv.stride,
-                                   padding=conv.padding)
-        model.features[0].bias.data = conv.bias
-        model.features[0].weight.data = conv.weight.mean(1).unsqueeze(1)  # inherit og 1st layer weights
-        model.classifier[-1] = Linear(in_features=classifier.in_features,
-                                      out_features=self.out_classes, bias=True)
+        if conv.in_channels != self.in_channels:
+            model.features[0] = Conv2d(self.in_channels, conv.out_channels,
+                                       kernel_size=conv.kernel_size, stride=conv.stride,
+                                       padding=conv.padding)
+            model.features[0].bias.data = conv.bias
+            model.features[0].weight.data = conv.weight.mean(1).unsqueeze(1)  # inherit og 1st layer weights
+
+        if classifier.out_features != self.out_classes:
+            model.classifier[-1] = Linear(in_features=classifier.in_features,
+                                          out_features=self.out_classes, bias=True)
 
         return Sequential(model, Softmax(1)) if self.soft_max else model
 
@@ -82,11 +85,16 @@ class PreBuildConverter:
         conv = model.features[0]
         classifier = model.classifier
 
-        model.features[0] = Conv2d(self.in_channels, conv.out_channels,
-                                   kernel_size=conv.kernel_size, stride=conv.stride,
-                                   padding=conv.padding, bias=conv.bias)
-        model.classifier = Linear(in_features=classifier.in_features,
-                                  out_features=self.out_classes, bias=True)
+        if conv.in_channels != self.in_channels:
+            model.features[0] = Conv2d(self.in_channels, conv.out_channels,
+                                       kernel_size=conv.kernel_size, stride=conv.stride,
+                                       padding=conv.padding, bias=conv.bias)
+            model.features[0].bias.data = conv.bias
+            model.features[0].weight.data = conv.weight.mean(1).unsqueeze(1)  # inherit og 1st layer weights
+
+        if classifier.out_features != self.out_classes:
+            model.classifier = Linear(in_features=classifier.in_features,
+                                      out_features=self.out_classes, bias=True)
 
         return Sequential(model, Softmax(1)) if self.soft_max else model
 
@@ -95,12 +103,16 @@ class PreBuildConverter:
         conv = model.features[0][0]
         classifier = model.classifier[-1]
 
-        model.features[0][0] = Conv2d(self.in_channels, conv.out_channels,
-                                      kernel_size=conv.kernel_size, stride=conv.stride,
-                                      padding=conv.padding, bias=conv.bias)
-        # todo inherit og 1st layer weights
-        model.classifier[-1] = Linear(in_features=classifier.in_features,
-                                      out_features=self.out_classes, bias=True)
+        if conv.in_channels != self.in_channels:
+            model.features[0][0] = Conv2d(self.in_channels, conv.out_channels,
+                                          kernel_size=conv.kernel_size, stride=conv.stride,
+                                          padding=conv.padding, bias=conv.bias)
+            model.features[0][0].bias.data = conv.bias
+            model.features[0][0].weight.data = conv.weight.mean(1).unsqueeze(1)  # inherit og 1st layer weights
+
+        if classifier.out_features != self.out_classes:
+            model.classifier[-1] = Linear(in_features=classifier.in_features,
+                                          out_features=self.out_classes, bias=True)
 
         return Sequential(model, Softmax(1)) if self.soft_max else model
 
@@ -127,11 +139,15 @@ class PreBuildConverter:
         conv = model.conv1[0]
         classifier = model.fc
 
-        model.conv1[0] = Conv2d(self.in_channels, conv.out_channels,
-                                      kernel_size=conv.kernel_size, stride=conv.stride,
-                                      padding=conv.padding, bias=conv.bias)
-        # todo inherit og 1st layer weights
-        model.fc = Linear(in_features=classifier.in_features,
-                                      out_features=self.out_classes, bias=True)
+        if conv.in_channels != self.in_channels:
+            model.conv1[0] = Conv2d(self.in_channels, conv.out_channels,
+                                          kernel_size=conv.kernel_size, stride=conv.stride,
+                                          padding=conv.padding, bias=conv.bias)
+            model.conv1[0].bias.data = conv.bias
+            model.conv1[0].weight.data = conv.weight.mean(1).unsqueeze(1)  # inherit og 1st layer weights
+
+        if classifier.out_features != self.out_classes:
+            model.fc = Linear(in_features=classifier.in_features,
+                                          out_features=self.out_classes, bias=True)
 
         return Sequential(model, Softmax(1)) if self.soft_max else model

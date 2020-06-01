@@ -32,7 +32,8 @@ label_names = [
     'ship',
     'truck'
 ]
-
+# for resnet 0.layer4.0.conv2 0.layer3.1.conv2
+# for densenet 0.features.denseblock3 0.features.denseblock4
 
 class Learner(object):
     def __init__(self, conf, inference=False):
