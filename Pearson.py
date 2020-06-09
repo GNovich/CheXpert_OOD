@@ -38,6 +38,10 @@ def pearsonr2d(x, y):
     r_val = r_num / r_den
     return r_val
 
+def pearsonr1d(x, y):
+    vx = x.sub(torch.mean(x))
+    vy = y.sub(torch.mean(y))
+    return torch.sum(vx * vy) / (torch.norm(vx, 2) * torch.norm(vy, 2) + 0.0000001)
 
 def cross_entropy(pred, soft_targets):
     logsoftmax = torch.nn.LogSoftmax()
@@ -98,6 +102,57 @@ def pearson_corr_loss(eta_hat, labels, threshold=0.9, has_sofmax=True):
     for i, j in combinations(range(n_models), 2):
         relevant_locs = wrong_classes_indicator[i] + wrong_classes_indicator[j]
         pairwise_corr = pearsonr2d(wrong_classes_outputs[i], wrong_classes_outputs[j])
+        pairwise_corr = pairwise_corr[relevant_locs > 0.]
+        relevant_locs = relevant_locs[relevant_locs > 0.]
+
+        pairwise_corr = pairwise_corr.sum() / (relevant_locs.shape[0] + 0.0001)
+        pearson_corr += pairwise_corr
+
+    pearson_corr /= comb(n_models, 2)
+    return pearson_corr
+
+
+def pearson_corr_loss_multicalss(eta_hat, labels, threshold=0.9):
+    n_models, n_batch, num_classes = eta_hat.shape
+    if n_models < 2:
+        return torch.tensor(0)
+
+    orig_mask = labels.type(torch.bool)
+    mask = ~orig_mask
+    sample_n_wrong = mask.sum(axis=-1).int().cpu().numpy()
+    sample_n_right = tuple(num_classes - sample_n_wrong)
+    sample_n_wrong = tuple(sample_n_wrong)
+
+    wrong_classes_outputs = [torch.masked_select(eta_hat[i], mask).split_with_sizes(sample_n_wrong)
+                             for i in
+                             range(len(eta_hat))]
+    right_classes_outputs = [torch.masked_select(eta_hat[i], orig_mask).split_with_sizes(sample_n_right)
+                             for i in
+                             range(len(eta_hat))]
+
+    # in multi class some samples can have... all classes!
+    right_classes_outputs = [[y for j,y in enumerate(x) if len(wrong_classes_outputs[i][j]) > 0] for i,x in
+                             enumerate(right_classes_outputs)]
+    wrong_classes_outputs = [[y for j, y in enumerate(x) if len(wrong_classes_outputs[i][j]) > 0] for i, x in
+                             enumerate(wrong_classes_outputs)]
+
+    wrong_classes_indicator = []
+    for model_res_w, model_res_r in zip(wrong_classes_outputs, right_classes_outputs):
+        model_indicator = []
+        for sample_w, sample_r in zip(model_res_w, model_res_r):
+            # in multi class some samples can have... everything!
+            indicator = sample_w - sample_r.mean() - threshold
+            indicator = torch.relu(-torch.min(indicator))
+            model_indicator.append(indicator)
+        wrong_classes_indicator.append(torch.stack(model_indicator))
+
+    pearson_corr = 0
+    for i, j in combinations(range(n_models), 2):
+        relevant_locs = wrong_classes_indicator[i] + wrong_classes_indicator[j]
+        pairwise_corr = []
+        for sample_i, sapmle_j in zip(wrong_classes_outputs[i], wrong_classes_outputs[j]):
+            pairwise_corr.append(pearsonr1d(sample_i, sapmle_j))
+        pairwise_corr = torch.stack(pairwise_corr)
         pairwise_corr = pairwise_corr[relevant_locs > 0.]
         relevant_locs = relevant_locs[relevant_locs > 0.]
 

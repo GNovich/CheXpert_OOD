@@ -19,6 +19,7 @@ def centering(K):
     unit = torch.ones([n, n])
     I = torch.eye(n)
     H = I - unit / n
+    H = H.to(device=K.device)
     return torch.matmul(torch.matmul(H, K), H)
 
 

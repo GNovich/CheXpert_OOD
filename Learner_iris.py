@@ -1,16 +1,17 @@
 import torch
+import torch.nn.functional as F
 from torch import optim
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from matplotlib import pyplot as plt
 from PIL import Image
 from torchvision import transforms as trans
-from torchvision import datasets
-from torch.utils.data import DataLoader, RandomSampler
 from sklearn.metrics import roc_curve
 import numpy as np
 import os
 from pathlib import Path
+import pandas as pd
+from sklearn.model_selection import train_test_split
 
 from models import PreBuildConverter, three_step_params
 from utils import get_time, gen_plot, separate_bn_paras
@@ -18,33 +19,32 @@ from conf_table_TB import plot_confusion_matrix
 plt.switch_backend('agg')
 
 """
-    This is a simple CIFAR demonstration for CKA loss + pearson
+    https://towardsdatascience.com/your-first-neural-network-in-pytorch-725631ae0fc
 """
 label_names = [
-    'airplane',
-    'automobile',
-    'bird',
-    'cat',
-    'deer',
-    'dog',
-    'frog',
-    'horse',
-    'ship',
-    'truck'
+    'Iris-setosa',
+    'Iris-versicolor',
+    'Iris-virginica'
 ]
-# for resnet 0.layer4.0.conv2 0.layer3.1.conv2
-# for densenet 0.features.denseblock3 0.features.denseblock4
 
 class Learner(object):
     def __init__(self, conf, inference=False):
 
         # -----------   define model --------------- #
-        self.n_classes = 10
-        build_model = PreBuildConverter(in_channels=3, out_classes=self.n_classes, add_func=True, softmax=True,
-                                        pretrained=conf.pre_train)
+        self.n_classes = 3
+
+        class LogisticRegression(torch.nn.Module):
+            def __init__(self):
+                super(LogisticRegression, self).__init__()
+                self.linear = torch.nn.Linear(in_features=4, out_features=3)
+
+            def forward(self, x):
+                y_pred = F.sigmoid(self.linear(x))
+                return y_pred
+
         self.models = []
         for _ in range(conf.n_models):
-            self.models.append(build_model.get_by_str(conf.net_mode).to(conf.device))
+            self.models.append(LogisticRegression().to(conf.device))
         print('{} {} models generated'.format(conf.n_models, conf.net_mode))
 
         # ------------  define params -------------- #
@@ -70,11 +70,21 @@ class Learner(object):
             'num_workers': conf.num_workers,
             'drop_last': False,
         }
-        self.ds = datasets.CIFAR10('data')
-        self.ds.transform = trans.ToTensor()
-        self.loader = DataLoader(self.ds, **dloader_args)
-        eval_sampler = RandomSampler(self.ds, replacement=True, num_samples=len(self.ds) // 10)
-        self.eval_loader = DataLoader(self.ds, sampler=eval_sampler, **dloader_args)
+
+        iris = pd.read_csv('https://raw.githubusercontent.com/pandas-dev/pandas/master/pandas/tests/data/iris.csv')
+        mappings = {
+            'Iris-setosa': 0,
+            'Iris-versicolor': 1,
+            'Iris-virginica': 2
+        }
+        iris['Name'] = iris['Name'].apply(lambda x: mappings[x])
+        X = iris.drop('Name', axis=1).values
+        y = iris['Name'].values
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        self.X_train = torch.FloatTensor(X_train).to(conf.device)
+        self.X_test = torch.FloatTensor(X_test).to(conf.device)
+        self.y_train = torch.LongTensor(y_train).to(conf.device)
+        self.y_test = torch.LongTensor(y_test).to(conf.device)
 
         self.cka_loss = conf.cka_loss(self.models, conf.cka_layers) if conf.cka else None
         if not inference:
@@ -84,7 +94,7 @@ class Learner(object):
             self.running_ensemble_loss = 0.
             self.running_cka_loss = 0.
 
-            self.board_loss_every = max(len(self.loader) // 4, 1)
+            self.board_loss_every = 1
             self.evaluate_every = conf.epoch_per_eval
             self.save_every = max(conf.epoch_per_save, 1)
             assert self.save_every >= self.evaluate_every
@@ -159,24 +169,17 @@ class Learner(object):
         ind_iter = range(do_mean, len(self.models))
         predictions = dict(zip(ind_iter, [[] for i in ind_iter]))
         prob = dict(zip(ind_iter, [[] for i in ind_iter]))
-        labels = []
-        pos = 2 if mode == 'train' else 1
-        self.loader.dataset.train = False
 
         with torch.no_grad():
-            for imgs, label in tqdm(self.eval_loader, total=len(self.eval_loader), desc=mode, position=pos):
-                imgs = imgs.to(conf.device)
+            self.optimizer.zero_grad()
+            thetas = [model(self.X_test).detach() for model in self.models]
+            if len(self.models) > 1: thetas = [torch.mean(torch.stack(thetas), 0)] + thetas
+            for ind, theta in zip(range(do_mean, len(self.models)), thetas):
+                val, arg = torch.max(theta, dim=1)
+                predictions[ind].append(arg.cpu().numpy())
+                prob[ind].append(theta.cpu().numpy())
 
-                self.optimizer.zero_grad()
-                thetas = [model(imgs).detach() for model in self.models]
-                if len(self.models) > 1: thetas = [torch.mean(torch.stack(thetas), 0)] + thetas
-                for ind, theta in zip(range(do_mean, len(self.models)), thetas):
-                    val, arg = torch.max(theta, dim=1)
-                    predictions[ind].append(arg.cpu().numpy())
-                    prob[ind].append(theta.cpu().numpy())
-                labels.append(label.detach().cpu().numpy())
-
-        labels = np.hstack(labels)
+        labels = self.y_test
         results = []
         for ind in range(do_mean, len(self.models)):
             curr_predictions = np.hstack(predictions[ind])
@@ -226,90 +229,85 @@ class Learner(object):
 
         epoch_iter = range(epochs)
         accuracy = 0
-        for e in epoch_iter:
+        for e in tqdm(epoch_iter, total=epochs):
             # check lr update
             for milestone in self.milestones:
                 if self.epoch == milestone:
                     self.schedule_lr()
 
             # train
-            self.loader.dataset.train = True
-            for imgs, labels in tqdm(self.loader, desc='epoch {}'.format(e), total=len(self.loader), position=0):
-                imgs = imgs.to(conf.device)
-                labels = labels.to(conf.device)
+            self.optimizer.zero_grad()
 
-                self.optimizer.zero_grad()
+            # calc embeddings
+            thetas = []
+            joint_losses = []
+            for model_num in range(conf.n_models):
+                theta = self.models[model_num](self.X_train)
+                thetas.append(theta)
+                joint_losses.append(conf.ce_loss(theta, self.X_test))
+            joint_losses = sum(joint_losses) / max(len(joint_losses), 1)
 
-                # calc embeddings
-                thetas = []
-                joint_losses = []
-                for model_num in range(conf.n_models):
-                    theta = self.models[model_num](imgs)
-                    thetas.append(theta)
-                    joint_losses.append(conf.ce_loss(theta, labels))
-                joint_losses = sum(joint_losses) / max(len(joint_losses), 1)
-
-                # calc loss
-                if conf.pearson:
-                    outputs = torch.stack(thetas)
-                    pearson_corr_models_loss = conf.pearson_loss(outputs, labels)
-                    self.running_pearson_loss += pearson_corr_models_loss.item()
-                    if conf.cka:
-                        cka_loss = self.cka_loss()
-                        self.running_cka_loss += cka_loss.item()
-                        pearson_corr_models_loss += cka_loss
-                    alpha = conf.alpha
-                    loss = (1 - alpha) * joint_losses + alpha * pearson_corr_models_loss
-                elif conf.joint_mean:
-                    mean_output = torch.mean(torch.stack(thetas), 0)
-                    ensemble_loss = conf.ce_loss(mean_output, labels)
-                    self.running_ensemble_loss += ensemble_loss.item()
-                    alpha = conf.alpha
-                    loss = (1 - alpha) * joint_losses + alpha * ensemble_loss
-                elif conf.cka:
-                    alpha = conf.alpha
+            # calc loss
+            if conf.pearson:
+                outputs = torch.stack(thetas)
+                pearson_corr_models_loss = conf.pearson_loss(outputs, self.X_test)
+                self.running_pearson_loss += pearson_corr_models_loss.item()
+                if conf.cka:
                     cka_loss = self.cka_loss()
                     self.running_cka_loss += cka_loss.item()
-                    loss = (1 - alpha) * joint_losses + alpha * cka_loss
-                elif conf.ncl:
-                    outputs = torch.stack(thetas)
-                    alpha = conf.alpha
-                    ncl_loss = conf.ncl_loss(outputs, labels)
-                    self.running_ncl_loss += ncl_loss.item()
-                    loss = (1 - alpha) * joint_losses + alpha * ncl_loss
-                else:
-                    loss = joint_losses
+                    pearson_corr_models_loss += cka_loss
+                alpha = conf.alpha
+                loss = (1 - alpha) * joint_losses + alpha * pearson_corr_models_loss
+            elif conf.joint_mean:
+                mean_output = torch.mean(torch.stack(thetas), 0)
+                ensemble_loss = conf.ce_loss(mean_output, self.X_test)
+                self.running_ensemble_loss += ensemble_loss.item()
+                alpha = conf.alpha
+                loss = (1 - alpha) * joint_losses + alpha * ensemble_loss
+            elif conf.cka:
+                alpha = conf.alpha
+                cka_loss = self.cka_loss()
+                self.running_cka_loss += cka_loss.item()
+                loss = (1 - alpha) * joint_losses + alpha * cka_loss
+            elif conf.ncl:
+                outputs = torch.stack(thetas)
+                alpha = conf.alpha
+                ncl_loss = conf.ncl_loss(outputs, self.X_test)
+                self.running_ncl_loss += ncl_loss.item()
+                loss = (1 - alpha) * joint_losses + alpha * ncl_loss
+            else:
+                loss = joint_losses
 
-                loss.backward()
-                self.running_loss += loss.item()
-                self.optimizer.step()
+            loss.backward()
+            self.running_loss += loss.item()
+            self.optimizer.step()
 
-                # listen to running losses
-                if self.step % self.board_loss_every == 0 and self.step != 0:
-                    loss_board = self.running_loss / self.board_loss_every
-                    self.writer.add_scalar('train_loss', loss_board, self.step)
-                    self.running_loss = 0.
-                    if conf.pearson:  # ganovich listening to pearson
-                        loss_board = self.running_pearson_loss / self.board_loss_every
-                        self.writer.add_scalar('pearson_loss', loss_board, self.step)
-                        self.running_pearson_loss = 0.
+            # listen to running losses
+            if self.step % self.board_loss_every == 0 and self.step != 0:
+                loss_board = self.running_loss / self.board_loss_every
+                self.writer.add_scalar('train_loss', loss_board, self.step)
+                self.running_loss = 0.
+                if conf.pearson:  # ganovich listening to pearson
+                    loss_board = self.running_pearson_loss / self.board_loss_every
+                    self.writer.add_scalar('pearson_loss', loss_board, self.step)
+                    self.running_pearson_loss = 0.
 
-                    if conf.joint_mean:
-                        loss_board = self.running_ensemble_loss / self.board_loss_every
-                        self.writer.add_scalar('ensemble_loss', loss_board, self.step)
-                        self.running_ensemble_loss = 0.
+                if conf.joint_mean:
+                    loss_board = self.running_ensemble_loss / self.board_loss_every
+                    self.writer.add_scalar('ensemble_loss', loss_board, self.step)
+                    self.running_ensemble_loss = 0.
 
-                    if conf.cka:
-                        loss_board = self.running_cka_loss / self.board_loss_every
-                        self.writer.add_scalar('cka_loss', loss_board, self.step)
-                        self.running_cka_loss = 0.
+                if conf.cka:
+                    loss_board = self.running_cka_loss / self.board_loss_every
+                    self.writer.add_scalar('cka_loss', loss_board, self.step)
+                    self.running_cka_loss = 0.
 
-                    if conf.ncl:
-                        loss_board = self.running_cka_loss / self.board_loss_every
-                        self.writer.add_scalar('ncl_loss', loss_board, self.step)
-                        self.running_cka_loss = 0.
+                if conf.ncl:
+                    loss_board = self.running_cka_loss / self.board_loss_every
+                    self.writer.add_scalar('ncl_loss', loss_board, self.step)
+                    self.running_cka_loss = 0.
 
-                self.step += 1
+            self.step += 1
 
             # listen to validation and save every so often
             if self.epoch % self.evaluate_every == 0:# and self.epoch != 0:

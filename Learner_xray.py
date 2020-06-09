@@ -1,46 +1,61 @@
+"""
+    Gal Novich skeleton learner
+    follows parametrization of for pretrained densenet121
+    NIH https://github.com/zoogzog/chexnet
+    CheXpert https://github.com/jfhealthcare/Chexpert/
+
+"""
 import torch
 from torch import optim
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from matplotlib import pyplot as plt
-from PIL import Image
-from torchvision import transforms as trans
-from torchvision import datasets
 from torch.utils.data import DataLoader, RandomSampler
-from sklearn.metrics import roc_curve
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 import os
 from pathlib import Path
-
+from sklearn.metrics import roc_auc_score
 from models import PreBuildConverter, three_step_params
-from utils import get_time, gen_plot, separate_bn_paras
-from conf_table_TB import plot_confusion_matrix
+from utils import get_time, separate_bn_paras
+from conf_table_TB import plot_auc_vector
+from Datasets import get_nih, get_chexpert
+
 plt.switch_backend('agg')
 
-"""
-    This is a simple CIFAR demonstration for CKA loss + pearson
-"""
-label_names = [
-    'airplane',
-    'automobile',
-    'bird',
-    'cat',
-    'deer',
-    'dog',
-    'frog',
-    'horse',
-    'ship',
-    'truck'
-]
-# for resnet 0.layer4.0.conv2 0.layer3.1.conv2
-# for densenet 0.features.denseblock3 0.features.denseblock4
 
 class Learner(object):
     def __init__(self, conf, inference=False):
 
-        # -----------   define model --------------- #
-        self.n_classes = 10
-        build_model = PreBuildConverter(in_channels=3, out_classes=self.n_classes, add_func=True, softmax=True,
+        # ------------  define dataset -------------- #
+        if conf.dat_mode == 'nih':
+            self.ds_train, self.ds_test = get_nih()
+        elif conf.dat_mode.lower() == 'chexpert':
+            chexpert_args = {'No_finding': conf.use_clean,
+                             'parenchymal': conf.use_int,
+                             'extraparenchymal': conf.use_ext,
+                             'limit_out_labels': conf.ood_limit
+                             }
+            self.ds_train, self.ds_test, self.out_in_table, self.out_out_table = get_chexpert(**chexpert_args)
+        else:
+            raise ValueError('no such dataset')
+
+        self.n_classes = len(self.ds_train.label_names)
+
+        # ------------  define loaders -------------- #
+        dloader_args = {
+            'batch_size': conf.batch_size,
+            'pin_memory': True,
+            'num_workers': conf.num_workers,
+            'drop_last': False,
+        }
+        self.loader = DataLoader(self.ds_train, **dloader_args)
+        eval_sampler = RandomSampler(self.ds_test, replacement=True, num_samples=len(self.ds_test) // 10)
+        self.eval_loader = DataLoader(self.ds_test, sampler=eval_sampler, **dloader_args)
+
+        # -----------   define models --------------- #
+        build_model = PreBuildConverter(in_channels=3, out_classes=self.n_classes,
+                                        add_func=True, softmax=False,  # sigmoid
                                         pretrained=conf.pre_train)
         self.models = []
         for _ in range(conf.n_models):
@@ -54,36 +69,30 @@ class Learner(object):
                 os.mkdir(conf.log_path)
             if not os.path.exists(conf.save_path):
                 os.mkdir(conf.save_path)
+
             self.writer = SummaryWriter(logdir=conf.log_path)
+            if conf.dat_mode.lower() == 'chexpert':
+                tables = [self.ds_train.table, self.ds_test.table, self.out_in_table, self.out_out_table]
+                names = ['ds_train', 'ds_test', 'out_in', 'out_out']
+                for name, table in zip(names, tables):
+                    table.to_csv(os.path.join(conf.log_path, name))
+
             self.step = 0
             self.epoch = 0
-            print('two model heads generated')
 
             self.get_opt(conf)
             print(self.optimizer)
-
-        # ------------  define loaders -------------- #
-
-        dloader_args = {
-            'batch_size': conf.batch_size,
-            'pin_memory': True,
-            'num_workers': conf.num_workers,
-            'drop_last': False,
-        }
-        self.ds = datasets.CIFAR10('data')
-        self.ds.transform = trans.ToTensor()
-        self.loader = DataLoader(self.ds, **dloader_args)
-        eval_sampler = RandomSampler(self.ds, replacement=True, num_samples=len(self.ds) // 10)
-        self.eval_loader = DataLoader(self.ds, sampler=eval_sampler, **dloader_args)
-
-        self.cka_loss = conf.cka_loss(self.models, conf.cka_layers) if conf.cka else None
-        if not inference:
             print('optimizers generated')
+
+            # ------------  define loss -------------- #
+            self.cka_loss = conf.cka_loss(self.models, conf.cka_layers) if conf.cka else None
             self.running_loss = 0.
             self.running_pearson_loss = 0.
             self.running_ensemble_loss = 0.
             self.running_cka_loss = 0.
+            self.running_ncl_loss = 0.
 
+            # ------------  define save/log times -------------- #
             self.board_loss_every = max(len(self.loader) // 4, 1)
             self.evaluate_every = conf.epoch_per_eval
             self.save_every = max(conf.epoch_per_save, 1)
@@ -97,29 +106,29 @@ class Learner(object):
             paras_only_bn.append(paras_only_bn_)
             paras_wo_bn.append(paras_wo_bn_)
 
-        self.optimizer = optim.SGD([
-                                       {'params': paras_wo_bn[model_num], 'weight_decay': 5e-4}
-                                       for model_num in range(conf.n_models)
-                                   ] + [
-                                       {'params': paras_only_bn[model_num]}
-                                       for model_num in range(conf.n_models)
-                                   ], lr=conf.lr, momentum=conf.momentum)
+        param_list = [
+                         {'params': paras_wo_bn[model_num], 'weight_decay': 5e-4}
+                         for model_num in range(conf.n_models)
+                     ] + [
+                         {'params': paras_only_bn[model_num]}
+                         for model_num in range(conf.n_models)
+                     ]
 
-    def save_state(self, conf, accuracy, to_save_folder=False, extra=None, model_only=False):
+        self.optimizer = optim.Adam(param_list, lr=conf.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-5)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.1, patience=5, mode='min')
+
+    def save_state(self, conf, auc, to_save_folder=False, extra=None, model_only=False):
         if to_save_folder:
             save_path = conf.save_path
         else:
             save_path = conf.model_path
         for mod_num in range(conf.n_models):
-            torch.save(
-                self.models[mod_num].state_dict(), Path(save_path) /
-                                                   ('model_{}_{}_accuracy:{}_step:{}_{}.pth'.format(mod_num, get_time(),
-                                                                                                    accuracy, self.step,
-                                                                                                    extra)))
-        torch.save(
-            self.optimizer.state_dict(), Path(save_path) /
-                                         ('optimizer_{}_accuracy:{}_step:{}_{}.pth'.format(get_time(), accuracy,
-                                                                                           self.step, extra)))
+            torch.save(self.models[mod_num].state_dict(),
+                       Path(save_path) / ('model_{}_{}_auc:{}_step:{}_{}.pth'.format(
+                           mod_num, get_time(), auc, self.step, extra)))
+        torch.save(self.optimizer.state_dict(),
+                   Path(save_path) / ('optimizer_{}_auc:{}_step:{}_{}.pth'.format(
+                       get_time(), auc, self.step, extra)))
 
     def load_state(self, conf, fixed_str, from_save_folder=False, model_only=False):
         if from_save_folder:
@@ -137,18 +146,13 @@ class Learner(object):
             load_fix(target_path)
             self.models[mod_num].load_state_dict(torch.load(target_path))
         if not model_only:
-            for mod_num in range(conf.n_models):
-                target_path = save_path / 'head_{}_{}'.format(mod_num, fixed_str)
-                load_fix(target_path)
-                self.heads[mod_num].load_state_dict(torch.load(target_path))
             target_path = save_path / 'optimizer_{}'.format(fixed_str)
             load_fix(target_path)
             self.optimizer.load_state_dict(torch.load(target_path))
 
-    def board_val(self, db_name, accuracy, roc_curve_tensor, cm_fig):
-        self.writer.add_scalar('{}_accuracy'.format(db_name), accuracy, self.step)
-        self.writer.add_image('{}_roc_curve'.format(db_name), roc_curve_tensor, self.step)
-        self.writer.add_figure('{}_conf_table'.format(db_name), cm_fig, self.step)
+    def board_val(self, db_name, auc, auc_fig):
+        self.writer.add_scalar('{}_auc'.format(db_name), auc, self.step)
+        self.writer.add_figure('{}_auc_vec'.format(db_name), auc_fig, self.step)
 
     def evaluate(self, conf, mode='test'):
 
@@ -157,7 +161,6 @@ class Learner(object):
 
         do_mean = -1 if len(self.models) > 1 else 0
         ind_iter = range(do_mean, len(self.models))
-        predictions = dict(zip(ind_iter, [[] for i in ind_iter]))
         prob = dict(zip(ind_iter, [[] for i in ind_iter]))
         labels = []
         pos = 2 if mode == 'train' else 1
@@ -166,31 +169,27 @@ class Learner(object):
         with torch.no_grad():
             for imgs, label in tqdm(self.eval_loader, total=len(self.eval_loader), desc=mode, position=pos):
                 imgs = imgs.to(conf.device)
+                bs, n_crops, c, h, w = imgs.size()
+                imgs = imgs.view(-1, c, h, w).cuda()
 
                 self.optimizer.zero_grad()
-                thetas = [model(imgs).detach() for model in self.models]
+                thetas = [model(imgs).view(bs, n_crops, -1).mean(1).detach() for model in self.models]
                 if len(self.models) > 1: thetas = [torch.mean(torch.stack(thetas), 0)] + thetas
                 for ind, theta in zip(range(do_mean, len(self.models)), thetas):
-                    val, arg = torch.max(theta, dim=1)
-                    predictions[ind].append(arg.cpu().numpy())
                     prob[ind].append(theta.cpu().numpy())
                 labels.append(label.detach().cpu().numpy())
 
-        labels = np.hstack(labels)
+        labels = np.vstack(labels)
         results = []
         for ind in range(do_mean, len(self.models)):
-            curr_predictions = np.hstack(predictions[ind])
             curr_prob = np.vstack(prob[ind])
 
-            # Compute ROC curve and ROC area for each class
-            img_d_fig = plot_confusion_matrix(labels, curr_predictions, label_names, tensor_name='dev/cm_' + mode)
-            res = (curr_predictions == labels)
-            acc = sum(res) / len(res)
-            fpr, tpr, _ = roc_curve(np.repeat(res, self.n_classes), curr_prob.ravel())
-            buf = gen_plot(fpr, tpr)
-            roc_curve_im = Image.open(buf)
-            roc_curve_tensor = trans.ToTensor()(roc_curve_im)
-            results.append((acc, roc_curve_tensor, img_d_fig))
+            AUROCs = []
+            for i in range(self.n_classes):
+                AUROCs.append(roc_auc_score(labels[:, i], curr_prob[:, i]))
+            AUROC_avg = np.array(AUROCs).mean()
+            img_d_fig = plot_auc_vector(AUROCs, self.ds_test.label_names)
+            results.append((AUROC_avg, img_d_fig))
         return results
 
     def pretrain(self, conf):
@@ -252,7 +251,12 @@ class Learner(object):
                 # calc loss
                 if conf.pearson:
                     outputs = torch.stack(thetas)
-                    pearson_corr_models_loss = conf.pearson_loss(outputs, labels)
+                    # we are ignoring the 'No Finding' label here.
+                    if conf.use_clean:
+                        not_clean = labels[:, 0] != 1
+                        pearson_corr_models_loss = conf.pearson_loss(outputs[:, not_clean, 1:], labels[not_clean, 1:])
+                    else:
+                        pearson_corr_models_loss = conf.pearson_loss(outputs, labels)
                     self.running_pearson_loss += pearson_corr_models_loss.item()
                     if conf.cka:
                         cka_loss = self.cka_loss()
@@ -305,20 +309,21 @@ class Learner(object):
                         self.running_cka_loss = 0.
 
                     if conf.ncl:
-                        loss_board = self.running_cka_loss / self.board_loss_every
+                        loss_board = self.running_ncl_loss / self.board_loss_every
                         self.writer.add_scalar('ncl_loss', loss_board, self.step)
-                        self.running_cka_loss = 0.
+                        self.running_ncl_loss = 0.
 
                 self.step += 1
 
+            self.scheduler.step(loss.data)
             # listen to validation and save every so often
-            if self.epoch % self.evaluate_every == 0:# and self.epoch != 0:
+            if self.epoch % self.evaluate_every == 0:  # and self.epoch != 0:
                 for mode in ['test', 'train']:
                     results = self.evaluate(conf=conf, mode=mode)
                     do_mean = -1 if len(self.models) > 1 else 0
-                    for model_num, (accuracy, roc_curve_tensor, img_d_fig) in zip(range(do_mean, conf.n_models), results):
-                        broad_name = 'mod_'+mode+'_' + str(model_num if model_num>-1 else 'mean')
-                        self.board_val(broad_name, accuracy, roc_curve_tensor, img_d_fig)
+                    for model_num, (auc, img_d_fig) in zip(range(do_mean, conf.n_models), results):
+                        broad_name = 'mod_' + mode + '_' + str(model_num if model_num > -1 else 'mean')
+                        self.board_val(broad_name, auc, img_d_fig)
                         if model_num > -1: self.models[model_num].train()
 
             if self.epoch % self.save_every == 0 and self.epoch != 0:
@@ -332,4 +337,3 @@ class Learner(object):
         for params in self.optimizer.param_groups:
             params['lr'] /= 10
         print(self.optimizer)
-

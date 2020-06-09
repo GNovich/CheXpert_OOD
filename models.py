@@ -1,5 +1,5 @@
 from torchvision import models
-from torch.nn import Conv2d, Linear, Sequential, Softmax, BatchNorm2d
+from torch.nn import Conv2d, Linear, Sequential, Softmax, BatchNorm2d, Sigmoid
 from string import digits
 import torch
 
@@ -35,12 +35,13 @@ def convert_syncbn_model(module, process_group=None):
     return mod
 
 class PreBuildConverter:
-    def __init__(self, in_channels, out_classes, add_soft_max=True, pretrained=False, half=False):
+    def __init__(self, in_channels, out_classes, add_func=False, softmax=False, pretrained=False, half=False):
         self.in_channels = in_channels
         self.out_classes = out_classes
-        self.soft_max = add_soft_max
         self.pretrained = pretrained
         self.half = half
+        self.add_func = add_func
+        self.softmax = softmax
 
     def get_by_str(self, name):
         name_clean = name.translate(str.maketrans('', '', digits)).lower()
@@ -55,11 +56,16 @@ class PreBuildConverter:
             ret_model = self.ResNet(name)
         if 'lenet' in name_clean:
             ret_model = self.LeNet(name)
+
+        if self.add_func:
+            ret_model = Sequential(ret_model, Softmax(1) if self.softmax else Sigmoid())
+
         if self.half:
             ret_model.half()  # convert to half precision
             for layer in ret_model.modules():
                 if isinstance(layer, BatchNorm2d):
                     layer.float()
+
         return ret_model
 
     def VGG(self, name='vgg16'):
@@ -78,7 +84,7 @@ class PreBuildConverter:
             model.classifier[-1] = Linear(in_features=classifier.in_features,
                                           out_features=self.out_classes, bias=True)
 
-        return Sequential(model, Softmax(1)) if self.soft_max else model
+        return model
 
     def DenseNet(self, name='densenet121'):
         model = getattr(models, name)(pretrained=self.pretrained)
@@ -96,7 +102,7 @@ class PreBuildConverter:
             model.classifier = Linear(in_features=classifier.in_features,
                                       out_features=self.out_classes, bias=True)
 
-        return Sequential(model, Softmax(1)) if self.soft_max else model
+        return model
 
     def MobileNet(self):
         model = getattr(models, 'mobilenet_v2')(pretrained=self.pretrained)
@@ -114,7 +120,7 @@ class PreBuildConverter:
             model.classifier[-1] = Linear(in_features=classifier.in_features,
                                           out_features=self.out_classes, bias=True)
 
-        return Sequential(model, Softmax(1)) if self.soft_max else model
+        return model
 
     def ResNet(self, name='resnet50'):
         model = getattr(models, name)(pretrained=bool(self.pretrained))
@@ -131,7 +137,7 @@ class PreBuildConverter:
             model.fc = Linear(in_features=classifier.in_features,
                                           out_features=self.out_classes, bias=True)
 
-        return Sequential(model, Softmax(1)) if self.soft_max else model
+        return model
 
 
     def LeNet(self):
@@ -150,4 +156,4 @@ class PreBuildConverter:
             model.fc = Linear(in_features=classifier.in_features,
                                           out_features=self.out_classes, bias=True)
 
-        return Sequential(model, Softmax(1)) if self.soft_max else model
+        return model
