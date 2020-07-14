@@ -1,5 +1,7 @@
 from torchvision import models
-from torch.nn import Conv2d, Linear, Sequential, Softmax, BatchNorm2d, Sigmoid
+from torch.nn import Conv2d, Linear, Sequential, Softmax, BatchNorm2d, Sigmoid, ReLU
+from torch import nn
+from torch.functional import F
 from string import digits
 import torch
 
@@ -34,14 +36,46 @@ def convert_syncbn_model(module, process_group=None):
     del module
     return mod
 
+
+class DenseRankHead(nn.Module):
+    def __init__(self, init_net, cat=False):
+        super(DenseRankHead, self).__init__()
+        self.cat = cat
+        self.features = init_net.features
+        self.classifier_label = init_net.classifier
+        in_dim = init_net.classifier.in_features
+        out_dim = init_net.classifier.out_features
+        rank_1 = Linear(in_features=in_dim if not cat else out_dim,
+                        out_features=in_dim if not cat else out_dim, bias=True)
+
+        rank_2 = Linear(in_features=in_dim if not cat else out_dim,
+                        out_features=in_dim if not cat else out_dim, bias=True)
+
+        rank_3 = Linear(in_features=in_dim if not cat else out_dim,
+                        out_features=out_dim, bias=True)
+        self.rank_classifier = Sequential(rank_1, ReLU(inplace=True), rank_2, ReLU(inplace=True), rank_3)
+
+    def forward(self, x):
+        features = self.features(x)
+        out = F.relu(features, inplace=True)
+        out = F.adaptive_avg_pool2d(out, (1, 1))
+        out = torch.flatten(out, 1)
+        label_out = torch.sigmoid(self.classifier_label(out))
+        rank_input = label_out if self.cat else out
+        rank_out = F.softmax(self.rank_classifier(rank_input), dim=1)
+        return label_out, rank_out
+
+
 class PreBuildConverter:
-    def __init__(self, in_channels, out_classes, add_func=False, softmax=False, pretrained=False, half=False):
+    def __init__(self, in_channels, out_classes, add_rank=False, cat=False, add_func=False, softmax=False, pretrained=False, half=False):
         self.in_channels = in_channels
         self.out_classes = out_classes
         self.pretrained = pretrained
         self.half = half
         self.add_func = add_func
+        self.add_rank = add_rank
         self.softmax = softmax
+        self.cat = cat
 
     def get_by_str(self, name):
         name_clean = name.translate(str.maketrans('', '', digits)).lower()
@@ -50,6 +84,8 @@ class PreBuildConverter:
             ret_model = self.VGG(name)
         if 'dense' in name_clean:
             ret_model = self.DenseNet(name)
+            if self.add_rank:
+                ret_model = DenseRankHead(ret_model, cat=self.cat)
         if 'mobilenet' in name_clean:
             ret_model = self.MobileNet()
         if 'resnet' in name_clean:

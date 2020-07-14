@@ -3,8 +3,8 @@ from Learner_xray import Learner
 import argparse
 import torch
 from functools import partial
-from torch.nn import MSELoss, BCELoss
-from Pearson import ncl_loss, pearson_corr_loss_multicalss
+from torch.nn import MSELoss, BCELoss, CrossEntropyLoss
+from Pearson import ncl_loss, pearson_corr_loss_multilabel, pearson_corr_loss
 from CKA_torch import CkaLoss
 
 if __name__ == '__main__':
@@ -34,8 +34,17 @@ if __name__ == '__main__':
     parser.add_argument("-cka_layers", "--cka_layers", help="using cka loss", default=[], type=str, nargs='*')
     parser.add_argument("-ncl", "--ncl", help="using Negative Correlation Loss", default=False, type=bool)
     parser.add_argument("-mean", "--joint_mean", help="using mean loss", default=False, type=bool)
-    parser.add_argument("-morph_dir", "--morph_dir", help="use a morph directory", default='', type=str)
+    parser.add_argument("-morph", "--morph", help="use a morph", default=False, type=int)
     parser.add_argument("-morph_a", "--morph_alpha", help="balance parameter", default=10., type=float)
+    parser.add_argument("-morph_t", "--morph_target", help="chosse morph tactic", default='zero', type=str)
+    parser.add_argument("-morph_dumb", "--morph_dumb", help="use dumb morphs", default=0, type=int)
+
+    # rank
+    parser.add_argument("-rank", "--rank", help="use rank loss", default=0, type=int)
+    parser.add_argument("-rank_a", "--rank_alpha", help="balance with other loss componenet", default=0, type=float)
+    parser.add_argument("-rank_p", "--rank_pearson", help="use rank pearson", default=0, type=int)
+    parser.add_argument("-rank_p_a", "--rank_pearson_alpha", help="balance within rank loss", default=0, type=float)
+    parser.add_argument("-cat", "--cat", help="make learner a concat or slide", default=0, type=int)
 
     # xray exp
     parser.add_argument("-use_clean", "--clean_label", help="use 'No Finding; class", default=1, type=int)
@@ -77,16 +86,27 @@ if __name__ == '__main__':
     conf.joint_mean = args.joint_mean
     conf.ncl = args.ncl
 
+    # rank param
+    conf.rank = args.rank
+    conf.rank_alpha = args.rank_alpha
+    conf.rank_pearson = args.rank_pearson
+    conf.rank_pearson_alpha = args.rank_pearson_alpha
+    conf.cat = args.cat
+
     # morph param
     conf.morph_alpha = args.morph_alpha
-    conf.morph_dir = args.morph_dir
+    conf.morph = args.morph
+    conf.morph_target = args.morph_target
+    conf.morph_dumb = args.morph_dumb
 
     # loss funcs
     conf.ce_loss = BCELoss()
-    conf.pearson_loss = partial(pearson_corr_loss_multicalss, threshold=conf.sig_thresh)
+    conf.pearson_loss = partial(pearson_corr_loss_multilabel, threshold=conf.sig_thresh)
     conf.cka_loss = CkaLoss
     conf.ncl_loss = partial(ncl_loss)
     conf.morph_loss = MSELoss()
+    conf.rank_loss = CrossEntropyLoss()
+    conf.rank_pearson_loss = partial(pearson_corr_loss, threshold=conf.sig_thresh)
 
     # xray exp
     conf.use_clean = args.clean_label
@@ -98,7 +118,7 @@ if __name__ == '__main__':
     param_desc = '_'.join(['n='+str(conf.n_models),
         str(conf.net_mode), 'lr='+str(conf.lr), 'm='+'_'.join([str(m) for m in conf.milestones]),
         ('a='+str(conf.alpha) if conf.n_models>1 else ''),
-        str(conf.batch_size), 'p='+str(conf.pearson), 'cka='+str(conf.cka)] +
+        str(conf.batch_size), 'p='+str(conf.pearson), 'mean='+str(conf.joint_mean), 'cka='+str(conf.cka)] +
 
         ([] if not conf.pre_train else
          ['pre', 'pre_layers='+'_'.join([str(m) for m in conf.pre_layers]),
@@ -106,7 +126,14 @@ if __name__ == '__main__':
 
         ([] if (args.clean_label * conf.use_int * conf.use_ext) == 1 else
            ['clean-int-ext=' + str(conf.use_clean) + '-' + str(conf.use_int) + '-' + str(conf.use_ext),
-            'limited=' + str(conf.ood_limit)])
+            'limited=' + str(conf.ood_limit)]) +
+
+        ([] if not args.rank else ['rank_alpha=' + str(conf.rank_alpha),
+                                    'rank_pearson=' + str(conf.rank_pearson_alpha)]) +
+
+        ([] if not args.morph else ['morph_alpha=' + str(conf.morph_alpha),
+                                    'morph_func=' + conf.morph_target])
+
         )
     conf.log_path = str(conf.log_path) + '_' + param_desc
     conf.save_path = str(conf.save_path) + '_' + param_desc

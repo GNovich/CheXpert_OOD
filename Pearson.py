@@ -1,7 +1,7 @@
 import torch
 from itertools import combinations
 from scipy.special import comb
-
+from torch.nn import MSELoss
 
 def pearsonr2d(x, y):
     """
@@ -112,7 +112,7 @@ def pearson_corr_loss(eta_hat, labels, threshold=0.9, has_sofmax=True):
     return pearson_corr
 
 
-def pearson_corr_loss_multicalss(eta_hat, labels, threshold=0.9):
+def pearson_corr_loss_multilabel(eta_hat, labels, threshold=0.9):
     n_models, n_batch, num_classes = eta_hat.shape
     if n_models < 2:
         return torch.tensor(0)
@@ -161,6 +161,7 @@ def pearson_corr_loss_multicalss(eta_hat, labels, threshold=0.9):
 
     pearson_corr /= comb(n_models, 2)
     return pearson_corr
+
 
 
 def set_bn_eval(m):

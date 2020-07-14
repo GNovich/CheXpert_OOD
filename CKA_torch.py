@@ -7,6 +7,9 @@
 
         "Ensemble Soft-Margin Softmax Loss for Image Classification"
         https://arxiv.org/pdf/1805.03922.pdf
+
+        "Out-of-Distribution Detection with Distance Guarantee in Deep Generative Models"
+        https://arxiv.org/pdf/2002.03328.pdf
 """
 import torch
 from functools import partial

@@ -14,11 +14,14 @@ from torch.utils.data import DataLoader, RandomSampler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 import os
+from PIL import Image
+from torchvision import transforms as trans
 from pathlib import Path
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.tree import DecisionTreeClassifier
 from models import PreBuildConverter, three_step_params
-from utils import get_time, separate_bn_paras
-from conf_table_TB import plot_auc_vector
+from utils import get_time, separate_bn_paras, gen_plot
+from conf_table_TB import plot_auc_vector, plot_confusion_matrix
 from Datasets import get_nih, get_chexpert
 
 plt.switch_backend('agg')
@@ -34,9 +37,11 @@ class Learner(object):
             chexpert_args = {'No_finding': conf.use_clean,
                              'parenchymal': conf.use_int,
                              'extraparenchymal': conf.use_ext,
-                             'limit_out_labels': conf.ood_limit
+                             'limit_out_labels': conf.ood_limit,
+                             'with_rank': conf.rank
                              }
-            self.ds_train, self.ds_test, self.out_in_table, self.out_out_table = get_chexpert(**chexpert_args)
+            self.ds_train, self.ds_test, self.out_in_ds, self.out_out_ds = get_chexpert(**chexpert_args)
+            self.ds_morph = get_chexpert(morph_load=conf.morph, **chexpert_args)
         else:
             raise ValueError('no such dataset')
 
@@ -52,11 +57,12 @@ class Learner(object):
         self.loader = DataLoader(self.ds_train, **dloader_args)
         eval_sampler = RandomSampler(self.ds_test, replacement=True, num_samples=len(self.ds_test) // 10)
         self.eval_loader = DataLoader(self.ds_test, sampler=eval_sampler, **dloader_args)
+        self.morph_loader = DataLoader(self.ds_morph, **dloader_args)
 
         # -----------   define models --------------- #
         build_model = PreBuildConverter(in_channels=3, out_classes=self.n_classes,
-                                        add_func=True, softmax=False,  # sigmoid
-                                        pretrained=conf.pre_train)
+                                        add_rank=conf.rank, #add_func=True, softmax=False,  # sigmoid
+                                        pretrained=conf.pre_train, cat=conf.cat)
         self.models = []
         for _ in range(conf.n_models):
             self.models.append(build_model.get_by_str(conf.net_mode).to(conf.device))
@@ -72,10 +78,13 @@ class Learner(object):
 
             self.writer = SummaryWriter(logdir=conf.log_path)
             if conf.dat_mode.lower() == 'chexpert':
-                tables = [self.ds_train.table, self.ds_test.table, self.out_in_table, self.out_out_table]
+                tables = [self.ds_train.table, self.ds_test.table,
+                          None if self.out_in_ds is None else self.out_in_ds.table , self.out_out_ds.table]
                 names = ['ds_train', 'ds_test', 'out_in', 'out_out']
                 for name, table in zip(names, tables):
-                    table.to_csv(os.path.join(conf.log_path, name))
+                    if table is None:
+                        continue
+                    table.to_csv(os.path.join(conf.save_path, name))
 
             self.step = 0
             self.epoch = 0
@@ -91,12 +100,16 @@ class Learner(object):
             self.running_ensemble_loss = 0.
             self.running_cka_loss = 0.
             self.running_ncl_loss = 0.
+            self.running_morph_loss = 0.
+            self.running_rank_loss = 0.
+            self.running_rank_pearson_loss = 0.
 
             # ------------  define save/log times -------------- #
             self.board_loss_every = max(len(self.loader) // 4, 1)
             self.evaluate_every = conf.epoch_per_eval
             self.save_every = max(conf.epoch_per_save, 1)
             assert self.save_every >= self.evaluate_every
+
 
     def get_opt(self, conf):
         paras_only_bn = []
@@ -154,34 +167,64 @@ class Learner(object):
         self.writer.add_scalar('{}_auc'.format(db_name), auc, self.step)
         self.writer.add_figure('{}_auc_vec'.format(db_name), auc_fig, self.step)
 
-    def evaluate(self, conf, mode='test'):
+    def board_val_rank(self, db_name, accuracy, roc_curve_tensor, cm_fig):
+        self.writer.add_scalar('{}_accuracy'.format(db_name), accuracy, self.step)
+        self.writer.add_image('{}_roc_curve'.format(db_name), roc_curve_tensor, self.step)
+        self.writer.add_figure('{}_conf_table'.format(db_name), cm_fig, self.step)
 
+    def evaluate(self, conf, mode='test'):
         for i in range(len(self.models)):
             self.models[i].eval()
 
         do_mean = -1 if len(self.models) > 1 else 0
         ind_iter = range(do_mean, len(self.models))
         prob = dict(zip(ind_iter, [[] for i in ind_iter]))
+        rank_prob = dict(zip(ind_iter, [[] for i in ind_iter]))
+        rank_predictions = dict(zip(ind_iter, [[] for i in ind_iter]))
         labels = []
+        rank_labels = []
         pos = 2 if mode == 'train' else 1
         self.loader.dataset.train = False
-
         with torch.no_grad():
             for imgs, label in tqdm(self.eval_loader, total=len(self.eval_loader), desc=mode, position=pos):
                 imgs = imgs.to(conf.device)
-                bs, n_crops, c, h, w = imgs.size()
-                imgs = imgs.view(-1, c, h, w).cuda()
+                if conf.rank:
+                    label, rank_label = label
+                    rank_labels.append(rank_label.detach().cpu().numpy())
+                labels.append(label.detach().cpu().numpy())
+
+                #bs, n_crops, c, h, w = imgs.size()
+                #imgs = imgs.view(-1, c, h, w).cuda()
 
                 self.optimizer.zero_grad()
-                thetas = [model(imgs).view(bs, n_crops, -1).mean(1).detach() for model in self.models]
+                #thetas = [model(imgs).view(bs, n_crops, -1).mean(1).detach() for model in self.models]
+                thetas = []
+                rank_thetas = []
+                for model_num in range(conf.n_models):
+                    if conf.rank:
+                        theta, rank_theta = self.models[model_num](imgs)
+                        rank_thetas.append(rank_theta.detach())
+                    else:
+                        theta = self.models[model_num](imgs)
+                    thetas.append(theta.detach())
+
                 if len(self.models) > 1: thetas = [torch.mean(torch.stack(thetas), 0)] + thetas
                 for ind, theta in zip(range(do_mean, len(self.models)), thetas):
                     prob[ind].append(theta.cpu().numpy())
-                labels.append(label.detach().cpu().numpy())
+
+                if conf.rank:
+                    if len(self.models) > 1: rank_thetas = [torch.mean(torch.stack(rank_thetas), 0)] + rank_thetas
+                    for ind, theta in zip(range(do_mean, len(self.models)), rank_thetas):
+                        val, arg = torch.max(theta, dim=1)
+                        rank_predictions[ind].append(arg.cpu().numpy())
+                        rank_prob[ind].append(theta.cpu().numpy())
 
         labels = np.vstack(labels)
+        if conf.rank:
+            rank_labels = np.hstack(rank_labels)
         results = []
         for ind in range(do_mean, len(self.models)):
+            cur_res = []
             curr_prob = np.vstack(prob[ind])
 
             AUROCs = []
@@ -189,7 +232,22 @@ class Learner(object):
                 AUROCs.append(roc_auc_score(labels[:, i], curr_prob[:, i]))
             AUROC_avg = np.array(AUROCs).mean()
             img_d_fig = plot_auc_vector(AUROCs, self.ds_test.label_names)
-            results.append((AUROC_avg, img_d_fig))
+            cur_res.append((AUROC_avg, img_d_fig))
+
+            if conf.rank:
+                curr_predictions = np.hstack(rank_predictions[ind])
+                curr_prob = np.vstack(rank_prob[ind])
+
+                img_d_fig = plot_confusion_matrix(rank_labels, curr_predictions, self.ds_test.label_names, tensor_name='dev/cm_' + mode)
+                res = (curr_predictions == rank_labels)
+                acc = sum(res) / len(res)
+                fpr, tpr, _ = roc_curve(np.repeat(res, self.n_classes), curr_prob.ravel())
+                buf = gen_plot(fpr, tpr)
+                roc_curve_im = Image.open(buf)
+                roc_curve_tensor = trans.ToTensor()(roc_curve_im)
+                cur_res.append((acc, roc_curve_tensor, img_d_fig))
+
+            results.append(cur_res)
         return results
 
     def pretrain(self, conf):
@@ -222,9 +280,13 @@ class Learner(object):
             self.running_ensemble_loss = 0.
             self.running_cka_loss = 0.
             self.running_ncl_loss = 0.
+            self.running_morph_loss = 0.
+            self.running_rank_loss = 0.
+            self.running_rank_pearson_loss = 0.
 
         epoch_iter = range(epochs)
         accuracy = 0
+
         for e in epoch_iter:
             # check lr update
             for milestone in self.milestones:
@@ -233,22 +295,59 @@ class Learner(object):
 
             # train
             self.loader.dataset.train = True
+            morph_iter = iter(self.morph_loader)
             for imgs, labels in tqdm(self.loader, desc='epoch {}'.format(e), total=len(self.loader), position=0):
                 imgs = imgs.to(conf.device)
+
+                if conf.rank:
+                    labels, rank_labels = labels
+                    rank_labels = rank_labels.to(conf.device)
                 labels = labels.to(conf.device)
+
+                if conf.morph:
+                    try:
+                        morph_imgs, morph_labels = next(morph_iter)
+                    except StopIteration:
+                        morph_iter = iter(self.morph_loader)
+                        morph_imgs, morph_labels = next(morph_iter)
+                    morph_imgs = morph_imgs.to(conf.device)
+                    morph_labels = morph_labels.to(conf.device)
 
                 self.optimizer.zero_grad()
 
                 # calc embeddings
                 thetas = []
+                rank_thetas = []
                 joint_losses = []
                 for model_num in range(conf.n_models):
-                    theta = self.models[model_num](imgs)
+                    if conf.rank:
+                        theta, rank_theta = self.models[model_num](imgs)
+                        rank_thetas.append(rank_theta)
+                    else:
+                        theta = self.models[model_num](imgs)
                     thetas.append(theta)
                     joint_losses.append(conf.ce_loss(theta, labels))
                 joint_losses = sum(joint_losses) / max(len(joint_losses), 1)
 
-                # calc loss
+
+                if conf.morph:
+                    morph_loss = []
+                    for model_num in range(conf.n_models):
+                        eta_hat = self.models[model_num](morph_imgs)
+                        if conf.morph_target == 'zero':
+                            correct_values = (eta_hat * morph_labels).sum(-1) / morph_labels.sum(-1)
+                            zero_labels = torch.zeros_like(correct_values)
+                            morph_loss.append(conf.morph_loss(correct_values, zero_labels))
+                        else:
+                            correct_values = (eta_hat * morph_labels).sum(-1) / morph_labels.sum(-1)
+                            average_values = eta_hat.mean(-1)
+                            morph_loss.append(conf.morph_loss(correct_values, average_values))
+                    morph_loss = sum(morph_loss) / max(len(morph_loss), 1)
+                    morph_loss *= conf.morph_alpha
+                    self.running_morph_loss += morph_loss.item()
+                    joint_losses = joint_losses + morph_loss
+
+
                 if conf.pearson:
                     outputs = torch.stack(thetas)
                     # we are ignoring the 'No Finding' label here.
@@ -265,7 +364,7 @@ class Learner(object):
                     alpha = conf.alpha
                     loss = (1 - alpha) * joint_losses + alpha * pearson_corr_models_loss
                 elif conf.joint_mean:
-                    mean_output = torch.mean(torch.stack(thetas), 0)
+                    mean_output = torch.prod(torch.stack(thetas), 0)
                     ensemble_loss = conf.ce_loss(mean_output, labels)
                     self.running_ensemble_loss += ensemble_loss.item()
                     alpha = conf.alpha
@@ -283,6 +382,25 @@ class Learner(object):
                     loss = (1 - alpha) * joint_losses + alpha * ncl_loss
                 else:
                     loss = joint_losses
+
+                # rank loss segment
+                if conf.rank:
+                    rank_losses = []
+                    for theta in rank_thetas:
+                        rank_losses.append(conf.rank_loss(theta, rank_labels))
+                    rank_loss = sum(rank_losses) / max(len(rank_losses), 1)
+                    self.running_rank_loss += rank_loss.item()
+
+                    if conf.rank_pearson:
+                        # eneter label rank convertere here?
+                        pearson_rank_loss = conf.rank_pearson_loss(torch.stack(rank_thetas), rank_labels)
+                        self.running_rank_pearson_loss += pearson_rank_loss.item()
+                        alpha = conf.rank_pearson_alpha
+                        rank_loss = (1 - alpha) * rank_loss + alpha * pearson_rank_loss
+
+                    alpha = conf.rank_alpha
+                    loss = (1 - alpha) * loss + alpha * rank_loss
+
 
                 loss.backward()
                 self.running_loss += loss.item()
@@ -313,6 +431,20 @@ class Learner(object):
                         self.writer.add_scalar('ncl_loss', loss_board, self.step)
                         self.running_ncl_loss = 0.
 
+                    if conf.morph:
+                        loss_board = self.running_morph_loss / self.board_loss_every
+                        self.writer.add_scalar('morph_loss', loss_board, self.step)
+                        self.running_morph_loss = 0.
+
+                    if conf.rank:
+                        loss_board = self.running_rank_loss / self.board_loss_every
+                        self.writer.add_scalar('rank_loss', loss_board, self.step)
+                        self.running_rank_loss = 0.
+                        if conf.rank_pearson:
+                            loss_board = self.running_rank_pearson_loss / self.board_loss_every
+                            self.writer.add_scalar('rank_pearson_loss', loss_board, self.step)
+                            self.running_rank_pearson_loss = 0.
+
                 self.step += 1
 
             self.scheduler.step(loss.data)
@@ -321,7 +453,17 @@ class Learner(object):
                 for mode in ['test', 'train']:
                     results = self.evaluate(conf=conf, mode=mode)
                     do_mean = -1 if len(self.models) > 1 else 0
-                    for model_num, (auc, img_d_fig) in zip(range(do_mean, conf.n_models), results):
+                    for cur_res in zip(range(do_mean, conf.n_models), results):
+                        if conf.rank:
+                            model_num, (label_res, rank_res) = cur_res
+                            acc, roc_curve_tensor, rank_img_d_fig = rank_res
+                            broad_name = 'mod_' + mode + '_' + str(model_num if model_num > -1 else 'mean')
+                            self.board_val_rank(broad_name, acc, roc_curve_tensor, rank_img_d_fig)
+                            auc, img_d_fig = label_res
+                        else:
+                            model_num, label_res = cur_res
+                            auc, img_d_fig = label_res
+
                         broad_name = 'mod_' + mode + '_' + str(model_num if model_num > -1 else 'mean')
                         self.board_val(broad_name, auc, img_d_fig)
                         if model_num > -1: self.models[model_num].train()

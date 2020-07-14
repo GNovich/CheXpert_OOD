@@ -40,19 +40,20 @@ def l2_norm(input, axis=2):
     return output
 
 
-def calc_emb_torch(image_tensor_batch, model, requires_grad, skip_model=False):
-    image_tensor_batch = Variable(torch.FloatTensor(image_tensor_batch.cuda(0)), requires_grad=requires_grad).cuda(0)
+def calc_emb_torch(image_tensor_batch, model, requires_grad, skip_model=False, device=0):
+    #image_tensor_batch = Variable(torch.FloatTensor(image_tensor_batch), requires_grad=requires_grad).cuda(device)
+    image_tensor_batch.requires_grad = True
     if skip_model:
         return None, image_tensor_batch
-    model.cuda(0)
-    emb = model(image_tensor_batch.to(0))
+    model.cuda(device)
+    emb = model(image_tensor_batch)[0]
 
-    emb = l2_norm(emb)
+    emb = l2_norm(emb, -1) # dont see why to normalize the embedding really
     return emb, image_tensor_batch
 
 
 def calc_loss(embA, embB, p=2):
-    return torch.pow(torch.pow(embA - embB, p).sum(dim=2), 1. / p).mean(0)
+    return torch.pow(torch.pow(embA - embB, p).sum(dim=-1), 1. / p).mean(0)
 
 
 def clip(image_tensor, start, end):
@@ -60,7 +61,7 @@ def clip(image_tensor, start, end):
     return image_tensor
 
 
-def morph(src_img, target_imgs, model_list, iterations, lr):
+def morph(src_img, target_imgs, model_list, iterations, lr, device=0):
     """ Updates the image to maximize outputs for n iterations """
     video_images = []
 
@@ -68,7 +69,7 @@ def morph(src_img, target_imgs, model_list, iterations, lr):
     for model in model_list:
         avg_embB = None
         for cropB in target_imgs:
-            embB, _ = calc_emb_torch(cropB, model, requires_grad=False, skip_model=False)
+            embB, _ = calc_emb_torch(cropB, model, requires_grad=False, skip_model=False, device=device)
             if avg_embB is None:
                 avg_embB = embB
             else:
@@ -76,15 +77,15 @@ def morph(src_img, target_imgs, model_list, iterations, lr):
         avg_embB = avg_embB / len(target_imgs)
         embB_list.append(avg_embB)
 
-    _, image_tensorA = calc_emb_torch(src_img, model, requires_grad=True, skip_model=True)
+    _, image_tensorA = calc_emb_torch(src_img, model, requires_grad=True, skip_model=True, device=device)
 
     for i in range(iterations):
         loss = 0
         for model_ind, model in enumerate(model_list):
             model.zero_grad()
-            embA = model(image_tensorA.to(0))
-            embA = l2_norm(embA)
-            curr_loss = calc_loss(embA, embB_list[model_ind]).to(0)
+            embA = model(image_tensorA.to(device))[0]
+            embA = l2_norm(embA, -1)
+            curr_loss = calc_loss(embA, embB_list[model_ind]).to(device)
             loss = loss + curr_loss
         loss = loss / len(model_list)
 
@@ -109,54 +110,51 @@ def morph(src_img, target_imgs, model_list, iterations, lr):
 
 
 class ImageProcessor:
-    def __init__(self, params):
+    def __init__(self, model_path_list=None, n_classes=0, force=0, dst_trans=None, lr=0.01, iterations=300):
         # model skeleton
-        device = 0
-        build_model = PreBuildConverter(in_channels=3, out_classes=params.n_classes,
+        self.devices = 3 #[0,1,2,3]
+        build_model = PreBuildConverter(in_channels=3, out_classes=n_classes,
                                         add_func=True, softmax=False, pretrained=False)
 
         # load weights
         def load_fix(target_path):
-            a = torch.load(target_path)
+            a = torch.load(target_path, map_location=lambda storage, loc: storage.cuda(self.devices))
             fixed_a = {k.split('module.')[-1]: a[k] for k in a}
             torch.save(fixed_a, target_path)
 
         self.models = []
-        for target_path in params.model_path_list:
-            model = build_model.get_by_str('densenet121').to(device)
-            model.reset_parameters()
+        for target_path in model_path_list:
+            model = build_model.get_by_str('densenet121').cuda(self.devices)
             load_fix(target_path)
             model.load_state_dict(torch.load(target_path))
             model.train(mode=False)
             self.models.append(model)
 
         # process params
-        self.force_regeneration = args.force
-        self.dst_path = args.dst_path
-        self.lr = args.lr
-        self.it_num = args.iterations
+        self.force_regeneration = force
+        self.dst_trans = dst_trans
+        self.lr = lr
+        self.it_num = iterations
 
     def process(self, sample):
         skipped = 0
         missing = 0
         failed = 0
 
-        inputs, label_str = sample
-        random_file_name = uuid.uuid4().hex.upper()[0:15] + '.jpg'
-        dest_img_path = os.path.join(self.dst_path, label_str, random_file_name)
+        inputs, label_str, path = sample
+        dest_img_path = self.dst_trans(path[0])
         os.makedirs(os.path.dirname(dest_img_path), exist_ok=True)
 
         if not self.force_regeneration and os.path.exists(dest_img_path):
             skipped += 1
         else:
-            inputs = np.array([inputs])
-            inputs = Variable(torch.FloatTensor(inputs.transpose(0, 3, 1, 2))).cuda(0)
+            inputs = Variable(torch.FloatTensor(inputs)).cuda(self.devices)
             dst_images = [inputs]
-            src_img = cv2.blur(inputs.cpu().data.numpy()[0].transpose(1, 2, 0), (17, 17))
+            src_img = cv2.blur(inputs.cpu().data.numpy()[0], (17, 17))
             im_array = np.array([src_img])
-            src_img = Variable(torch.FloatTensor(im_array.transpose(0, 3, 1, 2))).cuda(0)
+            src_img = Variable(torch.FloatTensor(im_array)).cuda(self.devices)
 
-            morph_from0_toA = morph(src_img, dst_images, self.models, iterations=self.it_num, lr=self.lr)
+            morph_from0_toA = morph(src_img, dst_images, self.models, iterations=self.it_num, lr=self.lr, device=self.devices)
 
             dst_im = (morph_from0_toA.transpose(1, 2, 0) * 255).astype(np.uint8)
             os.makedirs(os.path.dirname(dest_img_path), exist_ok=True)
@@ -166,7 +164,7 @@ class ImageProcessor:
 
 
 def generate_morphs(proc_num, loader, params):
-    generation_gpu_ids = [0, 1, 2, 3]
+    generation_gpu_ids = [3]#[0, 1, 2, 3]
     distributor = JobDistributor(proc_num, generation_gpu_ids, ImageProcessor, params=params, queue_size=100000)
 
     for batch_i, (inputs, labels) in enumerate(loader):
@@ -189,14 +187,14 @@ def generate_morphs(proc_num, loader, params):
         skipped += skipped_i
         missing += missing_i
         failed += failed_i
-        if processed % 10 == 0:
+        if processed % 100 == 0:
             print('Processed=%d, missing=%d, failed=%d, skipped=%d' % (processed, missing, failed, skipped))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='for CBIS-DDSM')
     # morph params
-    parser.add_argument("-model", "--model_path", help="path to model used for generation", type=str)
+    parser.add_argument("-model", "--model_paths", help="path to model used for generation", type=str, nargs='+')
     parser.add_argument("-res_dir", "--res_dir", help="target output dir name (will be created)", type=str)
     parser.add_argument("-dat_mode", "--dat_mode", help="choose dataset", default='chexpert', type=str)
     parser.add_argument("-it", "--iterations", help="training it per image", default=300, type=int)
@@ -214,25 +212,57 @@ if __name__ == '__main__':
 
     # get source data
     if args.dat_mode == 'nih':
-        ds_train, _ = get_nih()
+        ds_morph = get_nih(morph=True)
     elif args.dat_mode.lower() == 'chexpert':
-        chexpert_args = {'No_finding': args.use_clean,
-                         'parenchymal': args.use_int,
-                         'extraparenchymal': args.use_ext,
-                         'limit_out_labels': args.ood_limit
+        chexpert_args = {'No_finding': args.clean_label,
+                         'parenchymal': args.parenchymal,
+                         'extraparenchymal': args.extraparenchymal,
+                         'limit_out_labels': args.ood_limit,
+                         'with_path': True,
+                         'morph_gen': True
                          }
-        ds_train, _, _, _ = get_chexpert(**chexpert_args)
+        ds_morph = get_chexpert(**chexpert_args)
     else:
         raise ValueError('no such dataset')
-    args.n_classes = len(ds_train.label_names)
+    args.n_classes = len(ds_morph.label_names)
 
     # and loader
     dloader_args = {
         'batch_size': 1,
-        'pin_memory': True,
-        'num_workers': 1,
+        'pin_memory': False,
+        'num_workers': 0,
         'drop_last': False,
     }
-    loader = DataLoader(ds_train, **dloader_args)
+    loader = DataLoader(ds_morph, **dloader_args)
 
-    generate_morphs(args.processes_num, loader, params=args)
+
+    def path_to_morph(path):
+        # tranform an image path to target path
+        splitted_path = os.path.relpath(path, 'data').split('/')
+        dst_list = [os.path.relpath('data'), splitted_path[0] + '_morph'] + splitted_path[1:]
+        return os.path.join(*dst_list)
+
+    params = {'model_path_list': args.model_paths,
+              'n_classes': args.n_classes,
+              'force': args.force,
+              'dst_trans': path_to_morph,
+              'lr': args.lr,
+              'iterations': args.iterations
+    }
+
+    proc = ImageProcessor(**params)
+
+    # test for a single batch
+    missing = 0
+    failed = 0
+    skipped = 0
+
+    #generate_morphs(args.processes_num, loader, params=params)
+    for processed, sample in enumerate(tqdm(loader, total=len(loader))):
+        res = proc.process(sample)
+        skipped_i, missing_i, failed_i = res
+        skipped += skipped_i
+        missing += missing_i
+        failed += failed_i
+        if processed % 100 == 0:
+            print('Processed=%d, missing=%d, failed=%d, skipped=%d' % (processed, missing, failed, skipped))

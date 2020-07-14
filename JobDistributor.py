@@ -59,7 +59,7 @@ class ThreadSafeCounter():
 
 def worker(q_in, q_out, SlaveClass, params):
     try:
-        slave = SlaveClass(*params)    
+        slave = SlaveClass(**params)
         while True:
             job_id, metadata, data = q_in.get()
             if not (data is None and metadata is None):
@@ -171,7 +171,7 @@ class JobDistributor():
             sync_worker.daemon = True
             sync_worker.start()
         else:
-            self.single_slave = SlaveClass(*params) 
+            self.single_slave = SlaveClass(**params)
             
     def push(self, data, metadata=[]):
         self.total_pushed_jobs += 1
