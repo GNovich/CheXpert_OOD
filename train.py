@@ -24,7 +24,7 @@ if __name__ == '__main__':
     parser.add_argument("-pre", "--pre_train", help="use a pretrain net?", default=0, type=int)
     parser.add_argument("-pre_layers", "--pre_layers", help="layer steps to use?", default=[], type=int, nargs='*')
     parser.add_argument("-pre_step", "--pre_steps", help="what steps to use?", default=[], type=int, nargs='*')
-    parser.add_argument("-ngpu", "--ngpu", help="how many gpu's to use?", default=1, type=int)
+    parser.add_argument("-ngpu", "--ngpu", help="how many gpu's to use?", default=None, type=int)
 
     parser.add_argument("-m", "--milestones", help="fractions of where lr will be tuned", default=[], type=int, nargs='*')
     parser.add_argument("-a", "--alpha", help="balancing parameter", default=0, type=float)
@@ -61,7 +61,7 @@ if __name__ == '__main__':
 
     # training param
     conf.dat_mode = args.dat_mode
-    conf.ngpu = args.ngpu
+    conf.ngpu = args.ngpu or torch.cuda.device_count()
     conf.pre_layers = args.pre_layers
     conf.pre_steps = args.pre_steps
     conf.pre_train = args.pre_train
