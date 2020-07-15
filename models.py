@@ -38,13 +38,13 @@ def convert_syncbn_model(module, process_group=None):
 
 
 class DenseRankHead(nn.Module):
-    def __init__(self, init_net, cat=False):
+    def __init__(self, init_net, cat=False, rank_out_features=None):
         super(DenseRankHead, self).__init__()
         self.cat = cat
         self.features = init_net.features
         self.classifier_label = init_net.classifier
         in_dim = init_net.classifier.in_features
-        out_dim = init_net.classifier.out_features
+        out_dim = rank_out_features or init_net.classifier.out_features
         rank_1 = Linear(in_features=in_dim if not cat else out_dim,
                         out_features=in_dim if not cat else out_dim, bias=True)
 
@@ -66,14 +66,43 @@ class DenseRankHead(nn.Module):
         return label_out, rank_out
 
 
+class VGGRankHead(nn.Module):
+    def __init__(self, init_net, cat=False, rank_out_features=None):
+        super(VGGRankHead, self).__init__()
+        self.cat = cat
+        self.features = init_net.features
+        self.avgpool = init_net.avgpool
+        self.classifier_label = init_net.classifier
+        rank_out_features = rank_out_features or init_net.classifier[-1].out_features
+        self.rank_classifier = nn.Sequential(
+            nn.Linear(512 * 7 * 7, 4096),
+            nn.ReLU(True),
+            nn.Dropout(),
+            nn.Linear(4096, 4096),
+            nn.ReLU(True),
+            nn.Dropout(),
+            nn.Linear(4096, rank_out_features),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        label_out = torch.sigmoid(self.classifier_label(x))
+        rank_input = label_out if self.cat else x
+        rank_out = F.softmax(self.rank_classifier(rank_input), dim=1)
+        return label_out, rank_out
+
+
 class PreBuildConverter:
-    def __init__(self, in_channels, out_classes, add_rank=False, cat=False, add_func=False, softmax=False, pretrained=False, half=False):
+    def __init__(self, in_channels, out_classes, add_rank=False, rank_out_features=None, cat=False, add_func=False, softmax=False, pretrained=False, half=False):
         self.in_channels = in_channels
         self.out_classes = out_classes
         self.pretrained = pretrained
         self.half = half
         self.add_func = add_func
         self.add_rank = add_rank
+        self.rank_out_features = rank_out_features
         self.softmax = softmax
         self.cat = cat
 
@@ -82,10 +111,12 @@ class PreBuildConverter:
         ret_model = None
         if 'vgg' in name_clean:
             ret_model = self.VGG(name)
+            if self.add_rank:
+                ret_model = VGGRankHead(ret_model, cat=self.cat, rank_out_features=self.rank_out_features)
         if 'dense' in name_clean:
             ret_model = self.DenseNet(name)
             if self.add_rank:
-                ret_model = DenseRankHead(ret_model, cat=self.cat)
+                ret_model = DenseRankHead(ret_model, cat=self.cat, rank_out_features=self.rank_out_features)
         if 'mobilenet' in name_clean:
             ret_model = self.MobileNet()
         if 'resnet' in name_clean:

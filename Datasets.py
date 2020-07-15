@@ -89,7 +89,7 @@ def get_nih(seed=2020, morph=False, dumb_morph=False):
 
 
 class CheXpert(Dataset):
-    def __init__(self, table, transform=None, policy=1, with_path=False, with_rank=False, ranking=None):
+    def __init__(self, table, transform=None, policy=1, with_path=False, with_rank=False, rank_labels=None):
         self.with_path = with_path
         self.with_rank = with_rank
         self.table = table
@@ -100,10 +100,8 @@ class CheXpert(Dataset):
         self.transform = transform
 
         if with_rank:
-            mul_value = np.arange(len(ranking))
-            mul_value.put(ranking, np.arange(len(ranking))[::-1] + 1)
-            rank_labels = np.argmax(self.labels * mul_value, 1)
             self.rank_labels = torch.LongTensor(rank_labels)
+            self.n_rank_labels = rank_labels.max().item() + 1
 
     def __getitem__(self, index):
         image = Image.open(self.paths[index]).convert('RGB')
@@ -200,15 +198,25 @@ def get_chexpert(seed=2020, policy=1,
 
     # calculate rank by rarest condition
     labels_ = train_df[train_df.columns[2:]].fillna(0).values
-    ranking = np.argsort(labels_.sum(0) / len(labels_))#[::-1]
+    if extraparenchymal and No_finding and not parenchymal:
+        labels_ = np.concatenate([labels_[:, :2],  # 'No Finding', 'Support Devices''
+                                labels_[:, 2:5].sum(1)[:, None],  # 'Pleural Effusion', 'Pleural Other', 'Pneumothorax'
+                                labels_[:, 5:7].sum(1)[:, None],  # 'Cardiomegaly', 'Enlarged Cardiomediastinum'
+                                labels_[:, 7:]], axis=1)  # 'Fracture'
+        ranking = np.argsort(labels_.sum(0) / len(labels_))  # [::-1]
+    else:
+        ranking = np.argsort(labels_.sum(0) / len(labels_))  # [::-1]
+    mul_value = np.arange(len(ranking))
+    mul_value.put(ranking, np.arange(len(ranking))[::-1] + 1)
+    rank_labels = np.argmax(labels_ * mul_value, 1)
 
     if morph_gen or morph_load:
-        return CheXpert(train_df, transform=ImageNet_trans['morph'], policy=policy, with_path=with_path, ranking=ranking)
+        return CheXpert(train_df, transform=ImageNet_trans['morph'], policy=policy, with_path=with_path, rank_labels=rank_labels)
     elif dumb_morph:
         return CheXpert(train_df, transform=ImageNet_trans['dumb_morph'])
     else:
-        return (CheXpert(train_df, transform=ImageNet_trans['train'], policy=policy, with_path=with_path, with_rank=with_rank, ranking=ranking),
-                CheXpert(test_df, transform=ImageNet_trans[out_trans], policy=policy, with_path=with_path, with_rank=with_rank, ranking=ranking),
+        return (CheXpert(train_df, transform=ImageNet_trans['train'], policy=policy, with_path=with_path, with_rank=with_rank, rank_labels=rank_labels),
+                CheXpert(test_df, transform=ImageNet_trans[out_trans], policy=policy, with_path=with_path, with_rank=with_rank, rank_labels=rank_labels),
                 None if not limit_out_labels else CheXpert(cheXpert_out_in, transform=ImageNet_trans[out_trans], policy=policy, with_path=with_path, with_rank=False),
                 CheXpert(cheXpert_out_out, transform=ImageNet_trans[out_trans], policy=policy, with_path=with_path, with_rank=False),
                 )

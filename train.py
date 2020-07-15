@@ -13,7 +13,7 @@ if __name__ == '__main__':
     parser.add_argument('-lr', '--lr', help='learning rate', default=1e-3, type=float)
     parser.add_argument("-b", "--batch_size", help="batch size", default=96, type=int)
     parser.add_argument("-w", "--num_workers", help="number of workers", default=3, type=int)
-    parser.add_argument("-s", "--epoch_per_save", help="save_every s epochs", default=5, type=int)
+    parser.add_argument("-s", "--epoch_per_save", help="save_every s epochs", default=50, type=int)
     parser.add_argument("-eval", "--epoch_per_eval", help="eval_every eval epochs", default=1, type=int)
     parser.add_argument("-net", "--net_mode", help="choose net", default='resnet50', type=str)
     parser.add_argument("-dat", "--dat_mode", help="choose dataset", default='nih', type=str)

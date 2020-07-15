@@ -62,6 +62,7 @@ class Learner(object):
         # -----------   define models --------------- #
         build_model = PreBuildConverter(in_channels=3, out_classes=self.n_classes,
                                         add_rank=conf.rank, #add_func=True, softmax=False,  # sigmoid
+                                        rank_out_features=None if not conf.rank else self.ds_train.n_rank_labels,
                                         pretrained=conf.pre_train, cat=conf.cat)
         self.models = []
         for _ in range(conf.n_models):
@@ -241,7 +242,7 @@ class Learner(object):
                 img_d_fig = plot_confusion_matrix(rank_labels, curr_predictions, self.ds_test.label_names, tensor_name='dev/cm_' + mode)
                 res = (curr_predictions == rank_labels)
                 acc = sum(res) / len(res)
-                fpr, tpr, _ = roc_curve(np.repeat(res, self.n_classes), curr_prob.ravel())
+                fpr, tpr, _ = roc_curve(np.repeat(res, self.ds_test.n_rank_labels), curr_prob.ravel())
                 buf = gen_plot(fpr, tpr)
                 roc_curve_im = Image.open(buf)
                 roc_curve_tensor = trans.ToTensor()(roc_curve_im)

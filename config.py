@@ -53,7 +53,7 @@ def get_config(n_models=1, logext=''):
     conf.type_only = 0
     conf.no_bkg = 0
     conf.half = 0
-    conf.ngpu = 1
+    conf.ngpu = torch.cuda.device_count()
     conf.pre_layers = []
     conf.pre_steps = []
     conf.pre_train = []
