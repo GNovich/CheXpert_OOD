@@ -5,21 +5,14 @@ mkdir data/ISIC
 
 cd Git
 git clone https://github.com/GNovich/CKA.git
-ln -sfn ~/data data
-
-cd CKA/work_space
-ln -sfn ~/work_space/log log
-ln -sfn ~/work_space/history history
-ln -sfn ~/work_space/save save
-ln -sfn ~/work_space/models models
-ln -sfn ~/work_space/files files
+ln -sfn ~/data CKA/data
+ln -sfn ~/work_space CKA/work_space
 
 # download dataset
 cd ~/data
 cp -dr /mnt/md0/orville/Gal/ISIC.zip .
-uzip ISIC.zip
+unzip ISIC.zip
 rm ISIC.zip
 cd ~
 
 conda env create -f Git/CKA/environment.yml
-
