@@ -4,6 +4,7 @@ from torch import nn
 from torch.functional import F
 from string import digits
 import torch
+from efficientnet_pytorch import EfficientNet
 
 three_step_params = {'resnet18':[59, 44, -1], # 29, 14, 2
                      'resnet50':[158, 128, -1], # 71, 32, 2
@@ -94,6 +95,37 @@ class VGGRankHead(nn.Module):
         return label_out, rank_out
 
 
+class ResRankHead(nn.Module):
+    def __init__(self, init_net, cat=False, rank_out_features=None):
+        super(ResRankHead, self).__init__()
+        components = ['conv1', 'bn1', 'relu', 'maxpool',
+                      'layer1', 'layer2', 'layer3', 'layer4',
+                      'avgpool', 'fc']
+        for component in components:
+            setattr(self, component, getattr(init_net, component))
+        rank_out_features = rank_out_features or self.fc.out_featues
+        self.rank_classifier = nn.Linear(self.fc.in_features, rank_out_features)
+        self.cat = cat
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+
+        label_out = torch.sigmoid(self.fc(x))
+        rank_input = label_out if self.cat else x
+        rank_out = F.softmax(self.rank_classifier(rank_input), dim=1)
+        return label_out, rank_out
+
 class PreBuildConverter:
     def __init__(self, in_channels, out_classes, add_rank=False, rank_out_features=None, cat=False, add_func=False, softmax=False, pretrained=False, half=False):
         self.in_channels = in_channels
@@ -109,6 +141,13 @@ class PreBuildConverter:
     def get_by_str(self, name):
         name_clean = name.translate(str.maketrans('', '', digits)).lower()
         ret_model = None
+        if 'eff' in name_clean:
+            # 'efficientnet-b0' ... 'efficientnet-b6'
+            if self.pretrained:
+                ret_model = EfficientNet.from_pretrained(name, num_classes=self.out_classes)
+            else:
+                ret_model = EfficientNet.from_name(name)
+                # TODO add class support
         if 'vgg' in name_clean:
             ret_model = self.VGG(name)
             if self.add_rank:
@@ -121,6 +160,8 @@ class PreBuildConverter:
             ret_model = self.MobileNet()
         if 'resnet' in name_clean:
             ret_model = self.ResNet(name)
+            if self.add_rank:
+                ret_model = ResRankHead(ret_model, cat=self.cat, rank_out_features=self.rank_out_features)
         if 'lenet' in name_clean:
             ret_model = self.LeNet(name)
 

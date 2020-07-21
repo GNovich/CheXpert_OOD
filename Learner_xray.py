@@ -11,7 +11,7 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from matplotlib import pyplot as plt
 from torch.utils.data import DataLoader, RandomSampler
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 import numpy as np
 import os
 from PIL import Image
@@ -22,7 +22,7 @@ from sklearn.tree import DecisionTreeClassifier
 from models import PreBuildConverter, three_step_params
 from utils import get_time, separate_bn_paras, gen_plot
 from conf_table_TB import plot_auc_vector, plot_confusion_matrix
-from Datasets import get_nih, get_chexpert
+from Datasets import get_nih, get_chexpert, get_isic
 
 plt.switch_backend('agg')
 
@@ -33,6 +33,11 @@ class Learner(object):
         # ------------  define dataset -------------- #
         if conf.dat_mode == 'nih':
             self.ds_train, self.ds_test = get_nih()
+        if conf.dat_mode == 'isic':
+            dat_args = {'ood': conf.ood,
+                        'with_rank': conf.rank
+                        }
+            self.ds_train, self.ds_test = get_isic(**dat_args)
         elif conf.dat_mode.lower() == 'chexpert':
             chexpert_args = {'No_finding': conf.use_clean,
                              'parenchymal': conf.use_int,
@@ -55,9 +60,9 @@ class Learner(object):
             'drop_last': False,
         }
         self.loader = DataLoader(self.ds_train, **dloader_args)
-        eval_sampler = RandomSampler(self.ds_test, replacement=True, num_samples=len(self.ds_test) // 10)
+        eval_sampler = RandomSampler(self.ds_test, replacement=True, num_samples=len(self.ds_test) // 5)
         self.eval_loader = DataLoader(self.ds_test, sampler=eval_sampler, **dloader_args)
-        self.morph_loader = DataLoader(self.ds_morph, **dloader_args)
+        self.morph_loader = [] if not conf.morph else DataLoader(self.ds_morph, **dloader_args)
 
         # -----------   define models --------------- #
         build_model = PreBuildConverter(in_channels=3, out_classes=self.n_classes,
@@ -129,7 +134,8 @@ class Learner(object):
                      ]
 
         self.optimizer = optim.Adam(param_list, lr=conf.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-5)
-        self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.1, patience=5, mode='min')
+        #self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.1, patience=5, mode='min')
+        self.scheduler = StepLR(self.optimizer, step_size=25, gamma=0.2)
 
     def save_state(self, conf, auc, to_save_folder=False, extra=None, model_only=False):
         if to_save_folder:
@@ -194,8 +200,8 @@ class Learner(object):
                     rank_labels.append(rank_label.detach().cpu().numpy())
                 labels.append(label.detach().cpu().numpy())
 
-                #bs, n_crops, c, h, w = imgs.size()
-                #imgs = imgs.view(-1, c, h, w).cuda()
+                bs, n_crops, c, h, w = imgs.size()
+                imgs = imgs.view(-1, c, h, w).cuda()
 
                 self.optimizer.zero_grad()
                 #thetas = [model(imgs).view(bs, n_crops, -1).mean(1).detach() for model in self.models]
@@ -204,9 +210,13 @@ class Learner(object):
                 for model_num in range(conf.n_models):
                     if conf.rank:
                         theta, rank_theta = self.models[model_num](imgs)
+                        if mode != 'train':
+                            rank_theta = rank_theta.view(bs, n_crops, -1).mean(1).detach()
                         rank_thetas.append(rank_theta.detach())
                     else:
                         theta = self.models[model_num](imgs)
+                    if mode != 'train':
+                        theta = theta.view(bs, n_crops, -1).mean(1).detach()
                     thetas.append(theta.detach())
 
                 if len(self.models) > 1: thetas = [torch.mean(torch.stack(thetas), 0)] + thetas
@@ -236,10 +246,11 @@ class Learner(object):
             cur_res.append((AUROC_avg, img_d_fig))
 
             if conf.rank:
-                curr_predictions = np.hstack(rank_predictions[ind])
-                curr_prob = np.vstack(rank_prob[ind])
+                mask = (rank_labels != -1)
+                curr_predictions = np.hstack(rank_predictions[ind])[mask]
+                curr_prob = np.vstack(rank_prob[ind])[mask]
 
-                img_d_fig = plot_confusion_matrix(rank_labels, curr_predictions, self.ds_test.label_names, tensor_name='dev/cm_' + mode)
+                img_d_fig = plot_confusion_matrix(rank_labels, curr_predictions, self.ds_test.rank_label_names, tensor_name='dev/cm_' + mode)
                 res = (curr_predictions == rank_labels)
                 acc = sum(res) / len(res)
                 fpr, tpr, _ = roc_curve(np.repeat(res, self.ds_test.n_rank_labels), curr_prob.ravel())
@@ -249,6 +260,7 @@ class Learner(object):
                 cur_res.append((acc, roc_curve_tensor, img_d_fig))
 
             results.append(cur_res)
+
         return results
 
     def pretrain(self, conf):
@@ -448,7 +460,8 @@ class Learner(object):
 
                 self.step += 1
 
-            self.scheduler.step(loss.data)
+            if self.epoch > conf.sched_after:
+                self.scheduler.step()
             # listen to validation and save every so often
             if self.epoch % self.evaluate_every == 0:  # and self.epoch != 0:
                 for mode in ['test', 'train']:

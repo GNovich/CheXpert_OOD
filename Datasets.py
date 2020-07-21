@@ -8,6 +8,7 @@ import os
 from glob import glob
 import pandas as pd
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from torch.optim import lr_scheduler
 
 ImageNet_norm = trans.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
@@ -89,7 +90,8 @@ def get_nih(seed=2020, morph=False, dumb_morph=False):
 
 
 class CheXpert(Dataset):
-    def __init__(self, table, transform=None, policy=1, with_path=False, with_rank=False, rank_labels=None):
+    def __init__(self, table, transform=None, policy=1, with_path=False,
+                 with_rank=False, rank_labels=None, rank_label_names=None):
         self.with_path = with_path
         self.with_rank = with_rank
         self.table = table
@@ -102,6 +104,7 @@ class CheXpert(Dataset):
         if with_rank:
             self.rank_labels = torch.LongTensor(rank_labels)
             self.n_rank_labels = rank_labels.max().item() + 1
+            self.rank_label_names = rank_label_names
 
     def __getitem__(self, index):
         image = Image.open(self.paths[index]).convert('RGB')
@@ -204,19 +207,88 @@ def get_chexpert(seed=2020, policy=1,
                                 labels_[:, 5:7].sum(1)[:, None],  # 'Cardiomegaly', 'Enlarged Cardiomediastinum'
                                 labels_[:, 7:]], axis=1)  # 'Fracture'
         ranking = np.argsort(labels_.sum(0) / len(labels_))  # [::-1]
+        rank_label_names = ['No Finding', 'Support Devices', 'Pleural/Pneumothorax', 'Cardio', 'Fracture']
     else:
         ranking = np.argsort(labels_.sum(0) / len(labels_))  # [::-1]
+        rank_label_names = train_df.columns[2:].values
+
     mul_value = np.arange(len(ranking))
     mul_value.put(ranking, np.arange(len(ranking))[::-1] + 1)
     rank_labels = np.argmax(labels_ * mul_value, 1)
 
     if morph_gen or morph_load:
-        return CheXpert(train_df, transform=ImageNet_trans['morph'], policy=policy, with_path=with_path, rank_labels=rank_labels)
+        return CheXpert(train_df, transform=ImageNet_trans['morph'], policy=policy, with_path=with_path, rank_labels=rank_labels, rank_label_names=rank_label_names)
     elif dumb_morph:
         return CheXpert(train_df, transform=ImageNet_trans['dumb_morph'])
     else:
-        return (CheXpert(train_df, transform=ImageNet_trans['train'], policy=policy, with_path=with_path, with_rank=with_rank, rank_labels=rank_labels),
-                CheXpert(test_df, transform=ImageNet_trans[out_trans], policy=policy, with_path=with_path, with_rank=with_rank, rank_labels=rank_labels),
+        return (CheXpert(train_df, transform=ImageNet_trans['train'], policy=policy, with_path=with_path, with_rank=with_rank, rank_labels=rank_labels, rank_label_names=rank_label_names),
+                CheXpert(test_df, transform=ImageNet_trans[out_trans], policy=policy, with_path=with_path, with_rank=with_rank, rank_labels=rank_labels, rank_label_names=rank_label_names),
                 None if not limit_out_labels else CheXpert(cheXpert_out_in, transform=ImageNet_trans[out_trans], policy=policy, with_path=with_path, with_rank=False),
                 CheXpert(cheXpert_out_out, transform=ImageNet_trans[out_trans], policy=policy, with_path=with_path, with_rank=False),
                 )
+
+
+ISIC_trans = {'train':
+    trans.Compose([
+        trans.RandomResizedCrop(224),
+        trans.ColorJitter(brightness=32. / 255., saturation=0.5),
+        trans.RandomHorizontalFlip(),
+        trans.RandomVerticalFlip(),
+        trans.RandomAffine(180, scale=(0.8, 1.2), shear=10, resample=Image.BILINEAR),
+        trans.ToTensor(),
+        trans.RandomErasing(p=.5, scale=(0.01, 0.1), ratio=(1, 1)),
+        ImageNet_norm,
+    ]),
+    'test':
+    trans.Compose([
+        trans.Resize(256),
+        trans.TenCrop(224),
+        trans.Lambda(lambda crops: torch.stack([trans.ToTensor()(crop) for crop in crops])),
+        trans.Lambda(lambda crops: torch.stack([ImageNet_norm(crop) for crop in crops]))
+    ])
+}
+
+
+class ISIC(Dataset):
+    def __init__(self, table, transform=None, ood_name=None, with_path=False, mode='train'):
+        self.paths = ('data/ISIC/ISIC_2019_Training_Input/' + table.pop('image') + '.jpg').values
+        self.classes = table.columns
+        self.targets = torch.LongTensor(table.values.argmax(1))
+        self.transforms = transform
+        self.with_path = with_path
+        self.n_classes = len(self.classes)
+        self.ood = len(self.classes)-1 if (mode != 'train' and ood_name) else None
+        self.class_weights = torch.FloatTensor(len(self.targets) / table.values.sum(0))
+
+    def __getitem__(self, index):
+        image = Image.open(self.paths[index]).convert('RGB')
+        label = self.targets[index]
+        if self.transform is not None:
+            image = self.transform(image)
+        return (image, label, self.paths[index]) if self.with_path else (image, label)
+
+    def __len__(self):
+        return len(self.paths)
+
+    def evaluate(self):
+        self.transform = ISIC_trans['test']
+
+    def train(self):
+        self.transform = ISIC_trans['train']
+
+def get_isic(seed=2020, ood=None, with_rank=False, with_path=False):
+    train_df = pd.read_csv('data/ISIC/ISIC_2019_Training_GroundTruth.csv')
+    train_df.pop('UNK')
+    np.random.seed(seed)
+    msk = np.random.rand(len(train_df)) < 0.8
+    valid_df = train_df[~msk]
+    train_df = train_df[msk]
+
+    if ood:
+        valid_df = pd.concat([valid_df, train_df[(train_df[ood] == 1)]])
+        ood_col = train_df.pop(ood)
+        train_df = train_df[ood_col != 1]
+        valid_df = valid_df[(train_df.columns.tolist())+[ood]]  # reorder columns
+
+    return ISIC(train_df, transform=ISIC_trans['train'], with_path=with_path), \
+           ISIC(valid_df, transform=ISIC_trans['test'], mode='test', ood_name=ood, with_path=with_path)

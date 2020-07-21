@@ -2,6 +2,7 @@ import torch
 from itertools import combinations
 from scipy.special import comb
 from torch.nn import MSELoss
+from torch import masked_select, softmax
 
 def pearsonr2d(x, y):
     """
@@ -66,42 +67,34 @@ def ncl_loss(eta_hat):
     return ncl_val
 
 
-def pearson_corr_loss(eta_hat, labels, threshold=0.9, has_sofmax=True):
-    n_models, _, num_classes = eta_hat.shape
+def pearson_corr_loss(eta_hat, labels, threshold=0.9):
+    n_models, batch_size, num_classes = eta_hat.shape
+    #eta_hat = torch.softmax(eta_hat, 2)
     if n_models < 2:
         return torch.tensor(0)
 
+    # mask the ground truths
     orig_mask = torch.nn.functional.one_hot(labels, num_classes=num_classes)
     mask = (1 - orig_mask).type(torch.bool)
+    orig_mask = orig_mask.type(torch.bool)
 
-    if has_sofmax:
-        wrong_classes_outputs = [torch.masked_select(eta_hat[i], mask).reshape((-1, num_classes - 1))
-                                 for i in
-                                 range(len(eta_hat))]
+    # extract n-1 class values
+    wrong_class_outputs = [masked_select(model_eta, mask) for model_eta in eta_hat]
+    wrong_class_outputs = [masked_eta.reshape((-1, num_classes - 1)) for masked_eta in wrong_class_outputs]
 
-        wrong_classes_indicator = [
-            torch.masked_select(eta_hat[i], orig_mask.type(torch.bool)).reshape(
-                (-1, 1)) - torch.masked_select(eta_hat[i], mask).reshape(
-                (-1, num_classes - 1)) - threshold
-            for i in range(len(eta_hat))]
-    else:
-        wrong_classes_outputs = [torch.masked_select(torch.softmax(eta_hat[i], 1), mask).reshape((-1, num_classes - 1))
-                                 for i in
-                                 range(len(eta_hat))]
+    # If the target class has a very high confidence
+    # the confidence on the wrong classes is very low
+    # We are not be interested in the correlation between 'infinitesimal' values
+    usable_entries = [masked_select(model_eta, orig_mask).reshape((-1, 1)) -
+                      masked_select(model_eta, mask).reshape((-1, num_classes - 1)) -
+                      threshold for model_eta in eta_hat]
+    usable_entries = [torch.relu(-(model_indicator.min(1)).values) for model_indicator in usable_entries]
 
-        wrong_classes_indicator = [
-            torch.masked_select(torch.softmax(eta_hat[i], 1), orig_mask.type(torch.bool)).reshape(
-                (-1, 1)) - torch.masked_select(torch.softmax(eta_hat[i], 1), mask).reshape((-1, num_classes - 1)) - threshold
-            for i in range(len(eta_hat))]
-
-    wrong_classes_indicator = [torch.relu(-torch.min(wrong_classes_indicator[i], 1).values) for i in
-                               range(len(eta_hat))]
-
-    # ganovich - change to combination
+    # compute correlation for each model pair combination
     pearson_corr = 0
     for i, j in combinations(range(n_models), 2):
-        relevant_locs = wrong_classes_indicator[i] + wrong_classes_indicator[j]
-        pairwise_corr = pearsonr2d(wrong_classes_outputs[i], wrong_classes_outputs[j])
+        relevant_locs = usable_entries[i] + usable_entries[j]
+        pairwise_corr = pearsonr2d(wrong_class_outputs[i], wrong_class_outputs[j])
         pairwise_corr = pairwise_corr[relevant_locs > 0.]
         relevant_locs = relevant_locs[relevant_locs > 0.]
 
@@ -110,6 +103,7 @@ def pearson_corr_loss(eta_hat, labels, threshold=0.9, has_sofmax=True):
 
     pearson_corr /= comb(n_models, 2)
     return pearson_corr
+
 
 
 def pearson_corr_loss_multilabel(eta_hat, labels, threshold=0.9):

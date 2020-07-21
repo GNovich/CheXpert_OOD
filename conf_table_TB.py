@@ -33,7 +33,7 @@ def plot_confusion_matrix(correct_labels, predict_labels, labels, title='Confusi
 
     fig = matplotlib.figure.Figure(figsize=(4,4), dpi=320, facecolor='w', edgecolor='k')
     ax = fig.add_subplot(1, 1, 1)
-    im = ax.imshow(cm, cmap='Oranges', vmin=0.5 if normalize else 50, vmax=1 if normalize else 100)
+    im = ax.imshow(cm, cmap='Oranges', vmin=50 if normalize else 0.5, vmax=100 if normalize else 1)
 
     classes = [re.sub(r'([a-z](?=[A-Z])|[A-Z](?=[A-Z][a-z]))', r'\1 ', x) for x in labels]
     classes = ['\n'.join(wrap(l, 40)) for l in classes]

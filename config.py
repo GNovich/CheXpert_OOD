@@ -1,4 +1,4 @@
-from easydict import EasyDict as edict
+#from easydict import EasyDict as edict
 from pathlib import Path
 from torch.nn import CrossEntropyLoss
 from torchvision import transforms as trans
@@ -8,8 +8,17 @@ import time
 import torch
 import os
 
+
+class AttributeDict(dict):
+    def __getattr__(self, attr):
+        return self[attr]
+
+    def __setattr__(self, attr, value):
+        self[attr] = value
+
+
 def get_config(n_models=1, logext=''):
-    conf = edict()
+    conf = AttributeDict()
     ts = time.time()
     st = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d_%H:%M')
 
@@ -61,6 +70,7 @@ def get_config(n_models=1, logext=''):
     conf.n_patch = 2
     conf.bkg_prob = .5
     conf.epoch_per_save = 100
+    conf.sched_after = 25
     conf.data_mode = 'crop_data'
     conf.cpu_mode = 0
     conf.n_models = n_models
