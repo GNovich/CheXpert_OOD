@@ -124,6 +124,7 @@ dependencies:
   - pyasn1=0.4.8=py_0
   - pyasn1-modules=0.2.7=py_0
   - pycparser=2.20=py_0
+  - pydicom=2.0.0=pyh9f0ad1d_0
   - pygments=2.6.1=py_0
   - pyjwt=1.7.1=py37_0
   - pyopenssl=19.1.0=py37_0
@@ -174,4 +175,8 @@ dependencies:
   - zipp=3.1.0=py_0
   - zlib=1.2.11=h7b6447c_3
   - zstd=1.4.4=h0b5b093_3
+  - pip:
+    - efficientnet-pytorch==0.6.3
+    - future==0.18.2
 prefix: /home/ubuntu/anaconda3/envs/CKA
+
