@@ -225,8 +225,8 @@ class Learner(object):
             img_d_fig = plot_confusion_matrix(eval_labels, curr_predictions, label_names,
                                               tensor_name='dev/cm_' + mode)
 
-            sample_w = compute_sample_weight(class_weight, eval_labels)
-            recall = recall_score(eval_labels, curr_predictions, sample_weight=sample_w)
+            # sample_w = compute_sample_weight(class_weight, eval_labels)
+            recall = recall_score(eval_labels, curr_predictions, average='weighted')
             # res = (curr_predictions == eval_labels)
             # acc = sum(res) / len(res)
 
