@@ -83,7 +83,7 @@ class Learner(object):
             print('two model heads generated')
 
             self.get_opt(conf)
-            # self.scheduler = StepLR(self.optimizer, step_size=25, gamma=0.2)
+            self.scheduler = StepLR(self.optimizer, step_size=25, gamma=0.2)
 
             print('optimizers generated')
             self.running_loss = 0.
@@ -381,6 +381,7 @@ class Learner(object):
             if self.epoch % self.save_every == 0 and self.epoch != 0:
                 self.save_state(conf, accuracy)
             self.epoch += 1
+            self.scheduler.step()
 
         if accuracy is not None and save_final:
             self.save_state(conf, accuracy, to_save_folder=True, extra='final')
