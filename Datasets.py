@@ -1,6 +1,7 @@
 import torch
 from PIL import Image, ImageFilter
 from torchvision import transforms as trans
+from torchvision.datasets import ImageFolder
 from torch.utils.data import Dataset
 import numpy as np
 import cv2
@@ -251,21 +252,28 @@ ISIC_trans = {'train':
 
 class ISIC(Dataset):
     def __init__(self, table, transform=None, ood_name=None, with_path=False, mode='train'):
-        self.paths = ('data/ISIC/ISIC_2019_Training_Input/' + table.pop('image') + '.jpg').values
-        self.classes = table.columns
-        self.targets = torch.LongTensor(table.values.argmax(1))
-        self.transforms = transform
+        self.is_final = mode == 'final'
+        if self.is_final:
+            self.paths = ('data/ISIC/Test/ISIC_2019_Test_Input/' + table.pop('image') + '.jpg').values
+        else:
+            self.paths = ('data/ISIC/ISIC_2019_Training_Input/' + table.pop('image') + '.jpg').values
+            self.classes = table.columns
+            self.targets = torch.LongTensor(table.values.argmax(1))
+            self.n_classes = len(self.classes)
+            self.ood = len(self.classes) - 1 if (mode != 'train' and ood_name) else None
+            self.ood_name = ood_name
+            self.class_weights = torch.FloatTensor(len(self.targets) / table.values.sum(0))
+
+        self.transform = transform
         self.with_path = with_path
-        self.n_classes = len(self.classes)
-        self.ood = len(self.classes)-1 if (mode != 'train' and ood_name) else None
-        self.class_weights = torch.FloatTensor(len(self.targets) / table.values.sum(0))
 
     def __getitem__(self, index):
         image = Image.open(self.paths[index]).convert('RGB')
-        label = self.targets[index]
         if self.transform is not None:
             image = self.transform(image)
-        return (image, label, self.paths[index]) if self.with_path else (image, label)
+        if self.is_final:
+            return (image, self.paths[index]) if self.with_path else image
+        return (image, self.targets[index], self.paths[index]) if self.with_path else (image, self.targets[index])
 
     def __len__(self):
         return len(self.paths)
@@ -276,19 +284,30 @@ class ISIC(Dataset):
     def train(self):
         self.transform = ISIC_trans['train']
 
-def get_isic(seed=2020, ood=None, with_rank=False, with_path=False):
+def get_isic(seed=2020, ood='UNK', with_path=False, with_valid=True):
     train_df = pd.read_csv('data/ISIC/ISIC_2019_Training_GroundTruth.csv')
-    train_df.pop('UNK')
-    np.random.seed(seed)
-    msk = np.random.rand(len(train_df)) < 0.8
-    valid_df = train_df[~msk]
-    train_df = train_df[msk]
+    test_df = pd.read_csv('data/ISIC/ISIC_2019_Test_Metadata.csv')
+
+    if ood != 'UNK':
+        train_df.pop('UNK')
+
+    if with_valid:
+        np.random.seed(seed)
+        msk = np.random.rand(len(train_df)) < 0.8
+        valid_df = train_df[~msk]
+        train_df = train_df[msk]
 
     if ood:
-        valid_df = pd.concat([valid_df, train_df[(train_df[ood] == 1)]])
+        if with_valid:
+            valid_df = pd.concat([valid_df, train_df[(train_df[ood] == 1)]])
+            valid_df = valid_df[(train_df.columns.tolist())+[ood]]  # reorder columns
         ood_col = train_df.pop(ood)
         train_df = train_df[ood_col != 1]
-        valid_df = valid_df[(train_df.columns.tolist())+[ood]]  # reorder columns
 
-    return ISIC(train_df, transform=ISIC_trans['train'], with_path=with_path), \
-           ISIC(valid_df, transform=ISIC_trans['test'], mode='test', ood_name=ood, with_path=with_path)
+    if with_valid:
+        return ISIC(train_df, transform=ISIC_trans['train'], with_path=with_path), \
+               ISIC(valid_df, transform=ISIC_trans['test'], mode='test', ood_name=ood, with_path=with_path), \
+               ISIC(test_df, transform=ISIC_trans['test'], mode='final', ood_name=ood, with_path=with_path),
+    else:
+        return ISIC(train_df, transform=ISIC_trans['train']), \
+               ISIC(test_df, transform=ISIC_trans['test'], mode='final', with_path=with_path),

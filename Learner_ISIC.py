@@ -6,6 +6,7 @@ from matplotlib import pyplot as plt
 from torch.nn import MSELoss, BCELoss, CrossEntropyLoss
 from scipy.stats import entropy
 from PIL import Image
+import pandas as pd
 from torchvision import transforms as trans
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader, RandomSampler
@@ -24,10 +25,13 @@ plt.switch_backend('agg')
 class Learner(object):
     def __init__(self, conf, inference=False):
         # ------------  define dataset -------------- #
-        dat_args = {'ood': conf.ood,
-                    'with_rank': conf.rank
-                    }
-        self.ds_train, self.ds_test = get_isic(**dat_args)
+        self.do_valid = conf.valid_size > 0
+        if self.do_valid:
+            self.ds_train, self.ds_test, self.final = get_isic(ood=conf.ood, with_valid=conf.valid_size)
+        else:
+            self.ds_train, self.final = get_isic(ood=conf.ood, with_valid=conf.valid_size, with_path=True)
+            self.ds_test = self.ds_train
+
         self.n_classes = len(self.ds_train.classes)
 
         # ------------  define loaders -------------- #
@@ -41,17 +45,18 @@ class Learner(object):
 
         eval_sampler = RandomSampler(self.ds_test, replacement=True, num_samples=len(self.ds_test) // 2)
         dloader_args = {
-            'batch_size': int(np.ceil(conf.batch_size / 5)),
+            'batch_size': conf.batch_size, #int(np.ceil(conf.batch_size / 2)),
             'pin_memory': False,
             'num_workers': conf.num_workers,
             'drop_last': False,
         }
+        self.final_loader = DataLoader(self.final, **dloader_args)
         self.eval_loader = DataLoader(self.ds_test, sampler=eval_sampler, **dloader_args)
         # self.eval_loader = DataLoader(self.ds_test, **dloader_args)
 
         train_eval_sampler = RandomSampler(self.ds_train, replacement=True, num_samples=len(self.ds_train) // 10)
         dloader_args = {
-            'batch_size': int(np.ceil(conf.batch_size / 5)),
+            'batch_size': conf.batch_size, #int(np.ceil(conf.batch_size / 2)),
             'pin_memory': False,
             'num_workers': conf.num_workers,
             'drop_last': False,
@@ -208,7 +213,6 @@ class Learner(object):
         prob = {key: np.vstack(prob[key]) for key in prob}
         results = []
         label_names = eval_loader.dataset.classes
-        class_weight = dict(enumerate(self.ds_train.class_weights.numpy()))
         for ind in range(do_mean, len(self.models)):
             curr_predictions = predictions[ind]
             curr_prob = prob[ind]
@@ -254,6 +258,47 @@ class Learner(object):
             results.append((recall, roc_curve_tensor, img_d_fig))
 
         return results if (not report_ood) else (results, ood_auc)
+
+    def test_eval(self, conf):
+        for i in range(len(self.models)):
+            self.models[i].eval()
+
+        ind_iter = range(len(self.models))
+        # predictions = dict(zip(ind_iter, [[] for i in ind_iter]))
+        prob = dict(zip(ind_iter, [[] for i in ind_iter]))
+        image_paths = []
+
+        with torch.no_grad():
+            for imgs, paths in tqdm(self.final_loader, total=len(self.final_loader), desc='final'):
+                imgs = imgs.to(conf.device)
+                bs, n_crops, c, h, w = imgs.size()
+                imgs = imgs.view(-1, c, h, w).cuda()
+                image_paths.append(paths)
+
+                self.optimizer.zero_grad()
+                thetas = []
+                for model_num in range(conf.n_models):
+                    theta = self.models[model_num](imgs)
+                    theta = theta.view(bs, n_crops, -1).mean(1).detach()
+                    thetas.append(theta.detach())
+                    prob[model_num].append(theta.cpu().numpy())
+
+        #predictions = {key: np.hstack(predictions[key]) for key in predictions}
+        image_paths = pd.Series(np.concatenate(image_paths), name='image').apply(os.path.basename).str.strip('.jpg')
+        label_names = self.ds_train.classes.values.tolist()
+        prob = {key: np.vstack(prob[key]) for key in prob}
+
+        for model_num in range(conf.n_models):
+            model_results = pd.DataFrame(prob[model_num], columns=label_names, index=image_paths)
+            model_results.to_csv(str(model_num)+'_results.csv')
+
+        label_names.append('UNK')
+        ensemble_prob = np.stack([prob[ind] for ind in range(len(self.models))]).mean(0)
+        ood_confidance = 1 - ensemble_prob.max(1)
+        # entropy(ensemble_prob, axis=1, base=ensemble_prob.shape[1])
+        mean_results = np.concatenate([ensemble_prob, ood_confidance[:, None]], axis=1)
+        mean_results = pd.DataFrame(mean_results, columns=label_names, index=image_paths)
+        mean_results.to_csv('mean_results.csv')
 
     def pretrain(self, conf):
         for model_num in range(conf.n_models):
@@ -366,7 +411,8 @@ class Learner(object):
 
             # listen to validation and save every so often
             if self.epoch % self.evaluate_every == 0: # and self.epoch != 0:
-                for mode in ['test', 'train']:
+                modes = ['test', 'train'] if self.do_valid else ['train']
+                for mode in modes:
                     results = self.evaluate(conf=conf, mode=mode)
                     if mode != 'train' and conf.ood and len(self.models) > 1:
                         results, ood_auc = results

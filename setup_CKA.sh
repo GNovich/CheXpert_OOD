@@ -13,6 +13,8 @@ cd ~/data
 cp -dr /mnt/md0/orville/Gal/ISIC.zip .
 unzip ISIC.zip
 rm ISIC.zip
+mkdir ISIC/Test
+mv ISIC/ISIC_2019_Test_Input ISIC/Test/
 cd ~
 
 conda env create -f Git/CKA/environment.yml

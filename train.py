@@ -58,6 +58,7 @@ if __name__ == '__main__':
 
     # leison
     parser.add_argument("-ood", "--ood_label", help="choose ood label", default=None, type=str)
+    parser.add_argument("-valid", "--valid_size", help="choose validation ratio", default=0, type=str)
 
     args = parser.parse_args()
     conf = get_config(logext=args.logdir)
@@ -119,6 +120,7 @@ if __name__ == '__main__':
 
     # skin
     conf.ood = args.ood_label
+    conf.valid_size = args.valid_size
 
     # create learner and go
     param_desc = '_'.join(['n='+str(conf.n_models),
@@ -147,5 +149,7 @@ if __name__ == '__main__':
     learner = Learner(conf)
     if conf.pre_train:
         learner.pretrain(conf)
+        learner.test_eval(conf)
     else:
         learner.train(conf, conf.epochs)
+        learner.test_eval(conf)
